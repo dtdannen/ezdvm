@@ -21,6 +21,9 @@ from abc import ABC, abstractmethod
 from loguru import logger
 import asyncio
 import traceback
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class EZDVM(ABC):
@@ -93,7 +96,7 @@ class EZDVM(ABC):
                 self.logger.error(f"Could not create KIND objects from {kinds}: {str(e)}")
                 raise Exception(e)
 
-        if not ephemeral:
+        if os.getenv(kinds_env_var_name, False) and not ephemeral:
             kinds_env_value_str = ','.join([str(int(k.as_u16())) for k in kind_objs])
             # save to the .env file
             # check if .env file exists
@@ -168,13 +171,14 @@ class EZDVM(ABC):
                 event = await asyncio.wait_for(
                     self.job_queue.get(), timeout=1)
 
-                logger.info(f"Popped event off queue: {event.id}, about to send processing status")
+                logger.info(f"Popped event off queue: {event.id()}, about to send processing status")
                 await self.announce_status_processing(event)
 
                 logger.info(f"About to do work")
-                await self.do_work(event)
+                content = await self.do_work(event)
+                await self.send_dvm_result(event, content)
 
-                logger.info(f"Finished doing work for event: {event.id}")
+                logger.info(f"Finished doing work for event: {event.id()}")
 
             except asyncio.TimeoutError:
                 # If no events received within max_wait_time, continue to next iteration
@@ -190,6 +194,15 @@ class EZDVM(ABC):
         :return:
         """
         raise NotImplementedError("process_event is not implemented")
+
+    async def send_dvm_result(self, request_event, result_content):
+        """
+        Sends the result of the do_work() function out to the relays
+        :param result_content:
+        :return:
+        """
+        result_event = EventBuilder.job_result(request_event, result_content, millisats=0).to_event(self.keys())
+        await self.client.send_event(result_event)
 
     async def calculate_price(self, event):
         """
@@ -207,7 +220,7 @@ class EZDVM(ABC):
         feedback_event = EventBuilder.job_feedback(job_request=request_event,
                                                    status=DataVendingMachineStatus.PROCESSING,
                                                    extra_info=None,
-                                                   amount_millisats=None).to_event(self.keys)
+                                                   amount_millisats=0).to_event(self.keys)
         await self.client.send_event(feedback_event)
 
     async def check_paid(self, event):
