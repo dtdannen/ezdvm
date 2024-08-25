@@ -1,3 +1,5 @@
+from asyncio import CancelledError
+
 from nostr_sdk import (
     Keys,
     Client,
@@ -116,21 +118,7 @@ class EZDVM(ABC):
         await self.client.add_relay(relay)
 
     def start(self):
-        loop = asyncio.new_event_loop()
-        try:
-            self.logger.info("Starting EZDVM...")
-            loop.run_until_complete(self.async_start())
-        except KeyboardInterrupt:
-            self.logger.info("Keyboard interrupt received. Shutting down...")
-        except Exception as e:
-            self.logger.error(f"An error occurred: {str(e)}")
-            self.logger.error(traceback.format_exc())
-        finally:
-            self.logger.info("Closing client connection...")
-            loop.run_until_complete(self.client.disconnect())
-            self.logger.info("Closing event loop...")
-            loop.close()
-            self.logger.info("EZDVM shut down successfully.")
+        asyncio.run(self.async_start())
 
     async def async_start(self):
         dvm_filter = Filter().kinds(self.kinds).since(Timestamp.now())
@@ -159,6 +147,19 @@ class EZDVM(ABC):
             self.client.handle_notifications(handler)
         )
 
+        try:
+            await asyncio.gather(
+                self.process_events_off_queue(),
+                self.client.handle_notifications(handler)
+            )
+        except CancelledError:
+            self.logger.info("Tasks cancelled, shutting down...")
+        except Exception as e:
+            self.logger.error(f"An error occurred: {str(e)}")
+            self.logger.error(traceback.format_exc())
+        finally:
+            await self.shutdown()
+
     async def process_events_off_queue(self):
         while True:
             logger.info(f"Job Queue has {self.job_queue.qsize()} events")
@@ -166,6 +167,8 @@ class EZDVM(ABC):
                 # Wait for the first event or until max_wait_time
                 event = await asyncio.wait_for(
                     self.job_queue.get(), timeout=1)
+
+                
 
                 await self.announce_status_processing(event)
                 await self.do_work(event)
@@ -212,6 +215,11 @@ class EZDVM(ABC):
         :return:
         """
         raise NotImplementedError("check_paid is not implemented")
+
+    async def shutdown(self):
+        self.logger.info("Shutting down EZDVM...")
+        await self.client.disconnect()
+        self.logger.info("Client disconnected")
 
 
 
