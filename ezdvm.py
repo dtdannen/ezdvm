@@ -168,10 +168,13 @@ class EZDVM(ABC):
                 event = await asyncio.wait_for(
                     self.job_queue.get(), timeout=1)
 
-                
-
+                logger.info(f"Popped event off queue: {event.id}, about to send processing status")
                 await self.announce_status_processing(event)
+
+                logger.info(f"About to do work")
                 await self.do_work(event)
+
+                logger.info(f"Finished doing work for event: {event.id}")
 
             except asyncio.TimeoutError:
                 # If no events received within max_wait_time, continue to next iteration
@@ -204,7 +207,7 @@ class EZDVM(ABC):
         feedback_event = EventBuilder.job_feedback(job_request=request_event,
                                                    status=DataVendingMachineStatus.PROCESSING,
                                                    extra_info=None,
-                                                   amount_millisats=0).to_event(self.keys)
+                                                   amount_millisats=None).to_event(self.keys)
         await self.client.send_event(feedback_event)
 
     async def check_paid(self, event):
