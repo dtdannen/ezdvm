@@ -116,7 +116,7 @@ class EZDVM(ABC):
         await self.client.add_relay(relay)
 
     def start(self):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
         try:
             self.logger.info("Starting EZDVM...")
             loop.run_until_complete(self.async_start())
@@ -134,23 +134,32 @@ class EZDVM(ABC):
 
     async def async_start(self):
         dvm_filter = Filter().kinds(self.kinds).since(Timestamp.now())
-        await self.client.subscribe([dvm_filter])
+        self.logger.info("About to connect")
         await self.client.connect()
+        self.logger.info("About to subscribe")
+        await self.client.subscribe([dvm_filter])
+
 
         class NotificationHandler(HandleNotification):
             def __init__(self, ezdvm_instance):
                 self.ezdvm_instance = ezdvm_instance
 
             async def handle(self, relay_url: str, subscription_id: str,event: Event):
-                self.ezdvm_instance.job_queue.put(event)
+                await self.ezdvm_instance.job_queue.put(event)
                 self.ezdvm_instance.logger.info(f"Added event id {event.id} to job queue")
 
             async def handle_msg(self, relay_url: str, msg: RelayMessage):
                 self.ezdvm_instance.logger.info(f"Received message from {relay_url}: {msg}")
 
-        handler = NotificationHandler(self)
-        await self.client.handle_notifications(handler)
+        process_queue_task = asyncio.create_task(self.process_events_off_queue())
 
+        handler = NotificationHandler(self)
+        # Create a task for handle_notifications instead of awaiting it
+        handle_notifications_task = asyncio.create_task(
+            self.client.handle_notifications(handler)
+        )
+
+    async def process_events_off_queue(self):
         while True:
             logger.info(f"Job Queue has {self.job_queue.qsize()} events")
             try:
@@ -190,7 +199,9 @@ class EZDVM(ABC):
         Broadcasts an event stating that this DVM has started processing the event
         """
         feedback_event = EventBuilder.job_feedback(job_request=request_event,
-                                                   status=DataVendingMachineStatus.PROCESSING).to_event(self.keys)
+                                                   status=DataVendingMachineStatus.PROCESSING,
+                                                   extra_info=None,
+                                                   amount_millisats=0).to_event(self.keys)
         await self.client.send_event(feedback_event)
 
     async def check_paid(self, event):
