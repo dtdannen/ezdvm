@@ -9,6 +9,9 @@ from nostr_sdk import (
     Kind,
     Event,
     NostrError,
+    RelayMessage,
+    EventBuilder,
+    DataVendingMachineStatus
 )
 import os
 import json
@@ -20,8 +23,6 @@ import traceback
 
 class EZDVM(ABC):
 
-    INSTANCES = {}
-
     def __init__(self, kinds=None, nsec_str=None, ephemeral=False):
         self.logger = logger
         # this creates a logfile named after the child class's name
@@ -31,12 +32,7 @@ class EZDVM(ABC):
         self.kinds = self._get_or_set_kinds(kinds=kinds, ephemeral=ephemeral)
         self.signer = NostrSigner.keys(self.keys)
         self.client = Client(self.signer)
-        self.job_requests = asyncio.Queue()
-
-        # This gives us a global reference to this child
-        # TODO - really should just figure out how to keep access to this class from the inner handle notification class
-        if self.__class__.__name__ not in EZDVM.INSTANCES:
-            EZDVM.INSTANCES[self.__class__.__name__] = self
+        self.job_queue = asyncio.Queue()
 
     def _get_or_generate_keys(self, nsec_str=None, ephemeral=False):
         """
@@ -62,13 +58,13 @@ class EZDVM(ABC):
                 if not os.path.exists(env_file_path):
                     # .env file doesn't exist, create it
                     with open(env_file_path, 'w') as env_file:
-                        env_file.write(f"{nsec_env_var_name}={self.keys.secret_key()}\n")
+                        env_file.write(f"{nsec_env_var_name}={keys.secret_key().to_bech32()}\n")
                     logger.info(f"Created .env file and saved {nsec_env_var_name}")
                 else:
                     # .env file exists, append to it
                     with open(env_file_path, 'a') as env_file:
-                        env_file.write(f"{nsec_env_var_name}={self.keys.secret_key()}\n")
-                        env_file.write(f"{npub_env_var_name}={self.keys.public_key()}\n")
+                        env_file.write(f"{nsec_env_var_name}={keys.secret_key().to_bech32()}\n")
+                        env_file.write(f"{npub_env_var_name}={keys.public_key().to_bech32()}\n")
                     logger.info(f"Appended {nsec_env_var_name} to existing .env file")
             else:
                 logger.info(f"Did not save nsec and npub because ephemeral is {ephemeral}")
@@ -90,7 +86,7 @@ class EZDVM(ABC):
 
         else:
             try:
-                kind_objs = [Kind(int) for k in kinds]
+                kind_objs = [Kind(int(k)) for k in kinds]
             except Exception as e:
                 self.logger.error(f"Could not create KIND objects from {kinds}: {str(e)}")
                 raise Exception(e)
@@ -113,26 +109,65 @@ class EZDVM(ABC):
 
         return kind_objs
 
-    async def add_relay(self, relay):
+    def add_relay(self, relay):
+        asyncio.run(self.client.add_relay(relay))
+
+    async def async_add_relay(self, relay):
         await self.client.add_relay(relay)
 
-    async def start(self):
+    def start(self):
+        loop = asyncio.get_event_loop()
+        try:
+            self.logger.info("Starting EZDVM...")
+            loop.run_until_complete(self.async_start())
+        except KeyboardInterrupt:
+            self.logger.info("Keyboard interrupt received. Shutting down...")
+        except Exception as e:
+            self.logger.error(f"An error occurred: {str(e)}")
+            self.logger.error(traceback.format_exc())
+        finally:
+            self.logger.info("Closing client connection...")
+            loop.run_until_complete(self.client.disconnect())
+            self.logger.info("Closing event loop...")
+            loop.close()
+            self.logger.info("EZDVM shut down successfully.")
+
+    async def async_start(self):
         dvm_filter = Filter().kinds(self.kinds).since(Timestamp.now())
         await self.client.subscribe([dvm_filter])
         await self.client.connect()
 
-        # TODO - really should just figure out how to keep access to this class from the inner handle notification class
         class NotificationHandler(HandleNotification):
-            async def handle(inner_self, relay_url: "str",subscription_id: "str",event: "Event"):
-                return
+            def __init__(self, ezdvm_instance):
+                self.ezdvm_instance = ezdvm_instance
 
-    def stop(self):
-        pass
+            async def handle(self, relay_url: str, subscription_id: str,event: Event):
+                self.ezdvm_instance.job_queue.put(event)
+                self.ezdvm_instance.logger.info(f"Added event id {event.id} to job queue")
 
-    @staticmethod
-    async def add_event_to_queue
+            async def handle_msg(self, relay_url: str, msg: RelayMessage):
+                self.ezdvm_instance.logger.info(f"Received message from {relay_url}: {msg}")
 
-    async def do_work(event):
+        handler = NotificationHandler(self)
+        await self.client.handle_notifications(handler)
+
+        while True:
+            logger.info(f"Job Queue has {self.job_queue.qsize()} events")
+            try:
+                # Wait for the first event or until max_wait_time
+                event = await asyncio.wait_for(
+                    self.job_queue.get(), timeout=1)
+
+                await self.announce_status_processing(event)
+                await self.do_work(event)
+
+            except asyncio.TimeoutError:
+                # If no events received within max_wait_time, continue to next iteration
+                continue
+
+            await asyncio.sleep(0.001)
+
+    async def do_work(self, event):
         """
         Main function of the DVM to do its work on the event. This will only be called after the DVM has been paid,
          unless the DVM is free.
@@ -150,6 +185,14 @@ class EZDVM(ABC):
         """
         raise NotImplementedError("calculate_price is not implemented")
 
+    async def announce_status_processing(self, request_event):
+        """
+        Broadcasts an event stating that this DVM has started processing the event
+        """
+        feedback_event = EventBuilder.job_feedback(job_request=request_event,
+                                                   status=DataVendingMachineStatus.PROCESSING).to_event(self.keys)
+        await self.client.send_event(feedback_event)
+
     async def check_paid(self, event):
         """
         Put any custom code here to check if the event was paid, such as checking LNBits,
@@ -158,6 +201,8 @@ class EZDVM(ABC):
         :return:
         """
         raise NotImplementedError("check_paid is not implemented")
+
+
 
 
 
