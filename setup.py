@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="ezdvm",
-    version="0.1.0",
+    version="0.1.1",
     author="Dustin Dannenhauer",
     author_email="dustin@dvmdash.live",
     description="A simple python Data Vending Machine (DVM) implementation on nostr",
