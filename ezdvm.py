@@ -13,7 +13,9 @@ from nostr_sdk import (
     NostrError,
     RelayMessage,
     EventBuilder,
-    DataVendingMachineStatus
+    DataVendingMachineStatus,
+    Tag,
+    TagKind
 )
 import os
 import json
@@ -45,12 +47,12 @@ class EZDVM(ABC):
         logger.add(
             sys.stderr,
             format=console_format,
-            level="INFO",
+            level="DEBUG",
             colorize=True
         )
 
         # Add a handler for file logging
-        logger.add(f"{self.__class__.__name__}.log", rotation="500 MB", level="INFO")
+        logger.add(f"{self.__class__.__name__}.log", rotation="500 MB", level="DEBUG")
 
         self.logger = logger
 
@@ -267,17 +269,23 @@ class EZDVM(ABC):
         :param event:
         :return:
         """
-        raise NotImplementedError("calculate_price() is not implemented")
+        return 0
 
     async def announce_status_processing(self, request_event):
         """
         Broadcasts an event stating that this DVM has started processing the event
         """
-        feedback_event = EventBuilder.job_feedback(job_request=request_event,
-                                                   status=DataVendingMachineStatus.PROCESSING,
-                                                   extra_info=None,
-                                                   amount_millisats=0).to_event(self.keys)
+        tag_pointing_to_request_event = Tag.event(request_event.id())
+        tag_processing_status = Tag.parse(['status', 'processing'])
+
+        # Create an instance of EventBuilder
+        event_builder = EventBuilder(kind=Kind(7000), content="", tags=[tag_pointing_to_request_event,
+                                                                        tag_processing_status])
+
+        # Call to_event on the result
+        feedback_event = event_builder.to_event(self.keys)
         await self.client.send_event(feedback_event)
+        self.logger.debug(f"Send 'processing' feedback event: {feedback_event.as_json()}")
         return feedback_event
 
     async def check_paid(self, event):
@@ -287,7 +295,7 @@ class EZDVM(ABC):
         :param event:
         :return:
         """
-        raise NotImplementedError("check_paid() is not implemented")
+        return False
 
     async def shutdown(self):
         self.logger.info("Shutting down EZDVM...")
