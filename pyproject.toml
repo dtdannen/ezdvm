@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ezdvm"
+version = "0.1.0"
+authors = [
+    {name = "Dustin Dannenhauer", email = "dustin@dvmdash.live"},
+]
+description = "A simple python Data Vending Machine (DVM) implementation on nostr"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "nostr_sdk",
+    "loguru",
+    "python-dotenv",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/dtdannen/ezdvm"
+"Bug Tracker" = "https://github.com/dtdannen/ezdvm/issues"
+
+[tool.setuptools]
+packages = ["ezdvm"]

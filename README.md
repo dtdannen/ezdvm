@@ -3,14 +3,11 @@ Easily run any python code behind a DVM on Nostr. Just pick a kind (for basic te
 
 ## Install
 
-Currently for local development; not yet on pypi.
-
 ```commandline
 cd ezdvm/
 python3.12 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+pip install ezdvm
 ```
 
 ## Create your own DVM
@@ -41,6 +38,8 @@ if __name__ == "__main__":
     hello_world_dvm.add_relay("wss://nostr-pub.wellorder.net")
     hello_world_dvm.start()
 ```
+
+
 
 ## Testing
 
