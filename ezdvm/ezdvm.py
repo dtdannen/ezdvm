@@ -1,5 +1,5 @@
 from asyncio import CancelledError
-
+import nostr_sdk
 from nostr_sdk import (
     Keys,
     Client,
@@ -7,15 +7,11 @@ from nostr_sdk import (
     HandleNotification,
     Timestamp,
     LogLevel,
-    NostrSigner,
     Kind,
     Event,
-    NostrError,
     RelayMessage,
     EventBuilder,
-    DataVendingMachineStatus,
     Tag,
-    TagKind
 )
 import os
 import json
@@ -32,6 +28,9 @@ load_dotenv()
 class EZDVM(ABC):
 
     def __init__(self, kinds=None, nsec_str=None, ephemeral=False):
+        # Turn on nostr-sdk library logging
+        nostr_sdk.init_logger(LogLevel.DEBUG)
+
         # Remove all existing handlers
         logger.remove()
 
@@ -56,9 +55,8 @@ class EZDVM(ABC):
 
         self.logger = logger
 
-        self.keys = self._get_or_generate_keys(nsec_str=nsec_str, ephemeral=ephemeral)
+        self.signer = self._get_or_generate_keys(nsec_str=nsec_str, ephemeral=ephemeral)
         self.kinds = self._get_or_set_kinds(kinds=kinds, ephemeral=ephemeral)
-        self.signer = NostrSigner.keys(self.keys)
         self.client = Client(self.signer)
         self.job_queue = asyncio.Queue()
         self.finished_jobs = {}  # key is DVM Request event id, value is DVM Result event id
@@ -101,6 +99,12 @@ class EZDVM(ABC):
             return keys
 
     def _get_or_set_kinds(self, kinds:[int] = None, ephemeral=False):
+        """
+
+        :param kinds:
+        :param ephemeral:
+        :return:
+        """
         kinds_env_var_name = f"{self.__class__.__name__}_KINDS"
         kind_objs = None
         if kinds is None:
@@ -258,8 +262,10 @@ class EZDVM(ABC):
         :param result_content:
         :return:
         """
-        result_event = EventBuilder.job_result(request_event, result_content, millisats=0).to_event(self.keys)
-        await self.client.send_event(result_event)
+        result_event_builder = EventBuilder.job_result(request_event, result_content, millisats=0)
+        await self.client.send_event_builder(result_event_builder)
+        result_event = result_event_builder.build(self.signer.public_key())
+        self.logger.debug(f"Sending job result event: {result_event.as_json()}")
         return result_event
 
     async def calculate_price(self, event):
@@ -283,8 +289,8 @@ class EZDVM(ABC):
                                                                         tag_processing_status])
 
         # Call to_event on the result
-        feedback_event = event_builder.to_event(self.keys)
-        await self.client.send_event(feedback_event)
+        await self.client.send_event_builder(event_builder)
+        feedback_event = event_builder.build(self.signer.public_key())
         self.logger.debug(f"Send 'processing' feedback event: {feedback_event.as_json()}")
         return feedback_event
 
