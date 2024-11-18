@@ -1,13 +1,20 @@
 # ezdvm
 Easily run any python code behind a DVM on Nostr. Just pick a kind (for basic text-to-text use 5050) and put the code you want to run in the do_work() function. Then run the DVM. 
 
-## Install
+## Install from pip
 
 ```commandline
+pip install ezdvm
+```
+
+## Install from local repo for development on ezdvm
+
+```commandline
+git clone https://github.com/dtdannen/ezdvm.git
 cd ezdvm/
 python3.12 -m venv venv
 source venv/bin/activate
-pip install ezdvm
+pip install -e .
 ```
 
 ## Create your own DVM
