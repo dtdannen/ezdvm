@@ -90,7 +90,7 @@ class EZDVM(ABC):
                 else:
                     # .env file exists, append to it
                     with open(env_file_path, 'a') as env_file:
-                        env_file.write(f"{nsec_env_var_name}={keys.secret_key().to_bech32()}\n")
+                        env_file.write(f"\n{nsec_env_var_name}={keys.secret_key().to_bech32()}\n")
                         env_file.write(f"{npub_env_var_name}={keys.public_key().to_bech32()}\n")
                     logger.info(f"Appended {nsec_env_var_name} to existing .env file")
             else:
@@ -227,10 +227,10 @@ class EZDVM(ABC):
                                      f" with id: {processing_msg_event.id().to_hex()}")
 
                     self.logger.info(f"Starting to work on event {request_event_id_as_hex}")
-                    content = await self.do_work(event)
-                    self.logger.info(f"Results from do_work() function are: {content}")
+                    result_event = await self.do_work(event)
+                    self.logger.info(f"Results from do_work() function are: {result_event}")
                     self.logger.info(f"Broadcasting DVM Result event with the new results...")
-                    dvm_result_event = await self.send_dvm_result(event, content)
+                    dvm_result_event = await self.send_dvm_result(result_event)
                     result_event_id_as_hex = dvm_result_event.id().to_hex()
                     self.logger.info(f"Successfully sent DVM Result event with id: {result_event_id_as_hex}")
                     self.logger.info(f"View this DVM Result on "
@@ -256,16 +256,15 @@ class EZDVM(ABC):
         """
         raise NotImplementedError("do_work() is not implemented")
 
-    async def send_dvm_result(self, request_event, result_content):
+    async def send_dvm_result(self, result_event):
         """
         Sends the result of the do_work() function out to the relays
         :param result_content:
         :return:
         """
-        result_event_builder = EventBuilder.job_result(request_event, result_content, millisats=0)
-        await self.client.send_event_builder(result_event_builder)
-        result_event = result_event_builder.build(self.signer.public_key())
+
         self.logger.debug(f"Sending job result event: {result_event.as_json()}")
+        await self.client.send_event(result_event)
         return result_event
 
     async def calculate_price(self, event):
