@@ -1,1 +1,7 @@
 venv/
+.idea
+.env
+ezdvm.egg-info
+ezdvm/__pycache__
+build
+dist
