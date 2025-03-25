@@ -32,15 +32,14 @@ async def main():
     client = Client(signer)
 
     # Add relays and connect
-    #await client.add_relay("wss://localhost:8008")
-    await client.add_relay("wss://relay.damus.io")
-    await client.add_relay("wss://relay.primal.net")
-    await client.add_relay("wss://nos.lol")
-    await client.add_relay("wss://nostr-pub.wellorder.net")
+    # await client.add_relay("wss://localhost:8008")
+    await client.add_relay("wss://relay.dvmdash.live/")
     await client.connect()
 
     # Send an event using the Nostr Signer
-    builder = EventBuilder(kind=Kind(5050), content="New test from rust-nostr Python bindings!", tags=[])
+    builder = EventBuilder(
+        kind=Kind(5050), content="New test from rust-nostr Python bindings!", tags=[]
+    )
     await client.send_event_builder(builder)
     await client.set_metadata(Metadata().set_name("Testing rust-nostr"))
 
@@ -65,5 +64,5 @@ async def main():
         print(event.as_json())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())

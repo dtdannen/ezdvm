@@ -5,3 +5,4 @@ ezdvm.egg-info
 ezdvm/__pycache__
 build
 dist
+HelloWorldDVM.log
