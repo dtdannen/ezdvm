@@ -1,0 +1,5 @@
+openai
+python-dotenv
+loguru
+nostr-sdk
+ezdvm

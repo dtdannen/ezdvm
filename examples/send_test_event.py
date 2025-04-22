@@ -71,6 +71,22 @@ async def test_5050():
     await send_and_fetch(5050, 6050, builder)
 
 
+async def test_5050_llm():
+    """Test the LLM DVM with a conversation."""
+    message_json = {
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Tell me about Nostr DVMs in 2-3 sentences."},
+        ]
+    }
+
+    builder = EventBuilder(Kind(5050), json.dumps(message_json)).tags(
+        [Tag.parse(["t", "temperature", "0.7"]), Tag.parse(["m", "max_tokens", "100"])]
+    )
+
+    await send_and_fetch(5050, 6050, builder)
+
+
 async def test_5003():
     texts = ["first sentence", "second sentence"]  # ≤10 items
     builder = EventBuilder(Kind(5003), json.dumps(texts, separators=(",", ":"))).tags(
@@ -85,4 +101,6 @@ async def test_5003():
 
 
 if __name__ == "__main__":
-    asyncio.run(test_5003())
+    # Uncomment the test you want to run
+    # asyncio.run(test_5003())
+    asyncio.run(test_5050_llm())
