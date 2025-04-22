@@ -325,13 +325,9 @@ class EZDVM(ABC):
         tag_processing_status = Tag.parse(["status", "processing"])
 
         # Create an instance of EventBuilder
-        event_builder = EventBuilder(
-            kind=Kind(7000),
-            content="",
-            tags=[tag_pointing_to_request_event, tag_processing_status],
+        event_builder = EventBuilder(Kind(7000), "").tags(
+            [tag_pointing_to_request_event, tag_processing_status]
         )
-
-        # Call to_event on the result
         await self.client.send_event_builder(event_builder)
         feedback_event = event_builder.build(self.keys.public_key())
         self.logger.debug(
@@ -347,6 +343,12 @@ class EZDVM(ABC):
         :return:
         """
         return False
+
+    async def error_reply(self, req_event: Event, msg: str):
+        builder = EventBuilder(Kind(7000), msg).tags(
+            [Tag.parse(["e", req_event.id().to_hex()]), Tag.parse(["status", "error"])]
+        )
+        return await builder.sign(self.signer)
 
     async def shutdown(self):
         self.logger.info("Shutting down EZDVM...")
