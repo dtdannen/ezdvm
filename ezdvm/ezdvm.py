@@ -2,6 +2,7 @@ from asyncio import CancelledError
 import nostr_sdk
 from nostr_sdk import (
     Keys,
+    NostrSigner,
     Client,
     Filter,
     HandleNotification,
@@ -50,7 +51,12 @@ class EZDVM(ABC):
 
         self.logger = logger
 
-        self.signer = self._get_or_generate_keys(nsec_str=nsec_str, ephemeral=ephemeral)
+        # keep the raw keys around
+        self.keys = self._get_or_generate_keys(nsec_str=nsec_str, ephemeral=ephemeral)
+
+        # wrap them in a NostrSigner
+        self.signer = NostrSigner.keys(self.keys)
+
         self.kinds = self._get_or_set_kinds(kinds=kinds, ephemeral=ephemeral)
         self.client = Client(self.signer)
         self.job_queue = asyncio.Queue()
@@ -174,7 +180,7 @@ class EZDVM(ABC):
 
         self.logger.info(f"Subscribing to kinds {[k.as_u16() for k in self.kinds]}")
         dvm_filter = Filter().kinds(self.kinds).since(Timestamp.now())
-        await self.client.subscribe([dvm_filter])
+        await self.client.subscribe(dvm_filter)
         self.logger.info(f"Successfully subscribed.")
 
         class NotificationHandler(HandleNotification):
@@ -327,7 +333,7 @@ class EZDVM(ABC):
 
         # Call to_event on the result
         await self.client.send_event_builder(event_builder)
-        feedback_event = event_builder.build(self.signer.public_key())
+        feedback_event = event_builder.build(self.keys.public_key())
         self.logger.debug(
             f"Send 'processing' feedback event: {feedback_event.as_json()}"
         )

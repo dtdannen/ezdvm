@@ -1,68 +1,87 @@
 import asyncio
 import os
 from datetime import timedelta
-from nostr_sdk import *
 
+from nostr_sdk import (
+    Keys,
+    NostrSigner,
+    Client,
+    EventBuilder,
+    Kind,
+    Tag,
+    Filter,
+    LogLevel,
+    Metadata,
+    init_logger,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
+test_client_nsec = os.getenv("TEST_CLIENT_NSEC")  # nsec1… or raw hex
 
-test_client_nsec = os.getenv("TEST_CLIENT_NSEC")
+
+def build_client():
+    """
+    Build a Client with the keys taken from $TEST_CLIENT_NSEC.
+    Works whether the env‑var is a bech32 nsec or a raw 32‑byte hex string.
+    """
+    # ① Parse the keys
+    keys = Keys.parse(test_client_nsec)
+
+    print(f"public key : {keys.public_key().to_hex()}")
+    print(f"private key: {keys.secret_key().to_hex()}")
+
+    # ② Wrap them in a signer (required since v0.41)
+    signer = NostrSigner.keys(keys)
+
+    # ③ Create the client
+    return Client(signer)
 
 
-async def main():
-    # Init logger
+async def send_and_fetch(
+    kind_request: int, kind_response: int, tag_i: str | None = None
+):
     init_logger(LogLevel.INFO)
+    client = build_client()
 
-    # Initialize client without signer
-    # client = Client()
-
-    # Or, initialize with Keys signer
-    secret_key = SecretKey.from_hex(test_client_nsec)
-    signer = Keys(secret_key=secret_key)
-
-    print(f"public key: {signer.public_key().to_hex()}")
-    print(f"private key: {signer.secret_key().to_hex()}")
-
-    # Or, initialize with NIP46 signer
-    # app_keys = Keys.parse("..")
-    # uri = NostrConnectUri.parse("bunker://.. or nostrconnect://..")
-    # signer = NostrConnect(uri, app_keys, timedelta(seconds=60), None)
-
-    client = Client(signer)
-
-    # Add relays and connect
-    # await client.add_relay("wss://localhost:8008")
+    # Connect to a relay
     await client.add_relay("wss://relay.dvmdash.live/")
     await client.connect()
 
-    # Send an event using the Nostr Signer
+    # ---- send ---------------------------------------------------------------
     builder = EventBuilder(
-        kind=Kind(5050), content="New test from rust-nostr Python bindings!", tags=[]
+        Kind(kind_request), "New test from rust‑nostr Python bindings!"
     )
+    if tag_i is not None:
+        builder = builder.tags([Tag.parse(["i", tag_i])])
+
     await client.send_event_builder(builder)
-    await client.set_metadata(Metadata().set_name("Testing rust-nostr"))
+    await client.set_metadata(Metadata().set_name("SDK test script"))
 
-    # Mine a POW event and sign it with custom keys
-    # custom_keys = Keys.generate()
-    # print("Mining a POW text note...")
-    # event = EventBuilder.text_note("Hello from rust-nostr Python bindings!").pow(20).sign_with_keys(custom_keys)
-    # output = await client.send_event(event)
-    # print("Event sent:")
-    # print(f" hex:    {output.id.to_hex()}")
-    # print(f" bech32: {output.id.to_bech32()}")
-    # print(f" Successfully sent to:    {output.output.success}")
-    # print(f" Failed to send to: {output.output.failed}")
+    # ---- fetch --------------------------------------------------------------
+    sleep_time = 10
+    print(f"Sleeping for {sleep_time}")
+    await asyncio.sleep(sleep_time)  # give the DVM some time
 
-    await asyncio.sleep(2.0)
+    print("Getting events from relays …")
+    flt = Filter().kinds([Kind(kind_response), Kind(7000)])
+    events = await client.fetch_events(flt, timedelta(seconds=10))
 
-    # Get events from relays
-    print("Getting events from relays...")
-    f = Filter().kinds([Kind(6050), Kind(7000)])
-    events = await client.fetch_events([f], timedelta(seconds=10))
-    for event in events.to_vec():
-        print(event.as_json())
+    for ev in events.to_vec():
+        print(ev.as_json())
+
+
+async def test_5050():
+    await send_and_fetch(5050, 6050)
+
+
+async def test_5003():
+    await send_and_fetch(
+        kind_request=5003,
+        kind_response=6003,
+        tag_i="I want to make a DVM that takes text as an input and outputs text embeddings",
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(test_5003())
