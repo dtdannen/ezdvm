@@ -1,9 +1,12 @@
+# text2vector main.py
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 from ezdvm import EZDVM
 from nostr_sdk import Event, EventBuilder, Kind, Tag
 import json
+
+MAX_BATCH = 10  # safety guard
 
 
 class HelloWorldDVM(EZDVM):
@@ -25,59 +28,45 @@ class HelloWorldDVM(EZDVM):
         except Exception as e:
             raise
 
-    def get_embedding(self, text: str) -> list:
-        """Generate embedding for text using BGE model"""
-        # Tokenize the input text
-        encoded_input = self.tokenizer(
-            text,
-            padding=True,
-            truncation=True,
-            max_length=512,  # Limit token length
-            return_tensors="pt",
+    def get_embeddings(self, texts: list[str]) -> np.ndarray:
+        """Return an (n, d) array of L2‑normalised embeddings."""
+        assert 0 < len(texts) <= MAX_BATCH, "up to 10 inputs allowed"
+
+        enc = self.tokenizer(
+            texts, padding=True, truncation=True, max_length=512, return_tensors="pt"
         )
 
-        # Generate embeddings
         with torch.no_grad():
-            model_output = self.model(**encoded_input)
-            # Get the embeddings from the last hidden state
-            embeddings = model_output.last_hidden_state[:, 0, :]
-            # Normalize the embeddings
-            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            out = self.model(**enc)
+            emb = out.last_hidden_state[:, 0, :]
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
 
-        # Convert to numpy array for pgvector
-        result = np.array(embeddings[0].tolist())
-        return result
+        return emb.cpu().numpy()  # (n, 1024)
 
     async def do_work(self, event: Event):
+        texts = json.loads(event.content())
 
-        # get the "content" of the event at high level, if doesn't exist or empty, try 'i' tag
+        if not texts:
+            return await self.error_reply(event, "content must be a JSON list of texts")
 
-        # get the 'i' tag value, that's the string to embed
-        for tag in event.tags().to_vec():
-            tag_as_vec = tag.as_vec()
-            print(f"tag is: {tag_as_vec}")
+        if len(texts) > MAX_BATCH:
+            return await self.error_reply(event, f"max {MAX_BATCH} texts")
 
-            if tag_as_vec[0] == "i":
-                print(f"Found i tag: {tag_as_vec}")
-                text_input = tag_as_vec[1]
+        # 2. get embeddings
+        embeddings = self.get_embeddings(texts)  # (n, 1024) ndarray
+        payload = json.dumps(embeddings.tolist(), separators=(",", ":"))
 
-        # run the embedding model to get the embedding
-        embedding = self.get_embedding(text_input)
-
-        # build the event
-        # Send an event using the Nostr Signer
-        builder = EventBuilder(
-            kind=Kind(6003),
-            tags=[
-                Tag.parse(["embedding", json.dumps(embedding)]),
+        builder = EventBuilder(Kind(6003), payload).tags(
+            [
+                Tag.parse(["e", event.id().to_hex()]),
+                Tag.parse(["model", "bge-large-en-v1.5"]),
+                Tag.parse(["dim", str(embeddings.shape[1])]),
                 Tag.parse(["status", "success"]),
-            ],
+            ]
         )
+        resp_event = await builder.sign(self.signer)
 
-        # return the event builder object (the signing happens in the dvm library side)
-        response_event = await builder.sign(self.signer)
-
-        return response_event
+        return resp_event
 
 
 if __name__ == "__main__":

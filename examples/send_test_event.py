@@ -1,9 +1,11 @@
+# send_test_event.py
 import asyncio
 import os
 from datetime import timedelta
-
+import json
 from nostr_sdk import (
     Keys,
+    Event,
     NostrSigner,
     Client,
     EventBuilder,
@@ -38,9 +40,7 @@ def build_client():
     return Client(signer)
 
 
-async def send_and_fetch(
-    kind_request: int, kind_response: int, tag_i: str | None = None
-):
+async def send_and_fetch(kind_request: int, kind_response: int, builder: EventBuilder):
     init_logger(LogLevel.INFO)
     client = build_client()
 
@@ -49,12 +49,6 @@ async def send_and_fetch(
     await client.connect()
 
     # ---- send ---------------------------------------------------------------
-    builder = EventBuilder(
-        Kind(kind_request), "New test from rust‑nostr Python bindings!"
-    )
-    if tag_i is not None:
-        builder = builder.tags([Tag.parse(["i", tag_i])])
-
     await client.send_event_builder(builder)
     await client.set_metadata(Metadata().set_name("SDK test script"))
 
@@ -72,14 +66,21 @@ async def send_and_fetch(
 
 
 async def test_5050():
-    await send_and_fetch(5050, 6050)
+    message = "Hello this is a test"
+    builder = EventBuilder(Kind(5050), message)
+    await send_and_fetch(5050, 6050, builder)
 
 
 async def test_5003():
+    texts = ["first sentence", "second sentence"]  # ≤10 items
+    builder = EventBuilder(Kind(5003), json.dumps(texts, separators=(",", ":"))).tags(
+        [Tag.parse(["n", str(len(texts))])]
+    )  # optional metadata
+
     await send_and_fetch(
         kind_request=5003,
         kind_response=6003,
-        tag_i="I want to make a DVM that takes text as an input and outputs text embeddings",
+        builder=builder,
     )
 
 
