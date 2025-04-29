@@ -1,0 +1,71 @@
+# Docker Compose file for running all three DVMs
+
+services:
+  text2vector:
+    build:
+      context: .
+      dockerfile: examples/dvms/text2vector/Dockerfile
+    container_name: text2vector
+    restart: unless-stopped
+    networks:
+      - dvm_network
+    environment:
+      - HF_HUB_ENABLE_HF_TRANSFER=0
+      - TRANSFORMERS_OFFLINE=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    profiles:
+      - text2vector
+      - all
+
+  llm_dvm:
+    build:
+      context: .
+      dockerfile: examples/dvms/llm_dvm/Dockerfile
+    container_name: llm_dvm
+    restart: unless-stopped
+    networks:
+      - dvm_network
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # If you're using LM Studio locally, you might need to add:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # And update the base_url in the code to "http://host.docker.internal:1234/v1"
+    profiles:
+      - llm
+      - all
+
+  kind_recommender_dvm:
+    build:
+      context: .
+      dockerfile: examples/dvms/kind_recommender_dvm/Dockerfile
+    container_name: kind_recommender_dvm
+    restart: unless-stopped
+    networks:
+      - dvm_network
+    depends_on:
+      text2vector:
+        condition: service_healthy
+      llm_dvm:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Add any environment variables needed for the kind_recommender_dvm
+    profiles:
+      - kind_recommender
+      - all
+
+networks:
+  dvm_network:
+    driver: bridge

@@ -1,0 +1,5 @@
+numpy>=1.24.0
+scikit-learn>=1.2.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+nostr-sdk

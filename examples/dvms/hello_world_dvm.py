@@ -7,7 +7,8 @@ class HelloWorldDVM(EZDVM):
 
     def __init__(self):
         # choose the job request kinds you will listen and respond to
-        super().__init__(kinds=self.kinds)
+        # disable nostr_sdk logging and truncate long event content to prevent cluttering logs
+        super().__init__(kinds=self.kinds, nostr_sdk_log_level=None, log_full_events=False)
 
     async def do_work(self, event):
         return "Hello World!"

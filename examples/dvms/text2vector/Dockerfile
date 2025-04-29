@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -29,15 +29,20 @@ RUN mkdir -p /root/.cache/huggingface/hub/models--BAAI--bge-large-en-v1.5/snapsh
     # Create model.json to tell transformers where to find the files
     echo '{"bge-large-en-v1.5": "/root/.cache/huggingface/hub/models--BAAI--bge-large-en-v1.5/snapshots/c43af0e0c0d29de68b4d14e2cc489aa098caf7f0"}' > /root/.cache/huggingface/hub/models.json
 
-COPY requirements.txt .
+COPY examples/dvms/text2vector/requirements.txt .
 RUN pip config set global.timeout 300 && \
     pip config set global.retries 10 && \
     pip config set global.index-url https://pypi.org/simple && \
     pip install --no-cache-dir -r requirements.txt
 
 
-# Copy the rest of the application
-COPY . .
+# Copy the ezdvm package and install it
+COPY ezdvm/ ./ezdvm/
+COPY pyproject.toml .
+RUN pip install -e .
+
+# Copy the application code
+COPY examples/dvms/text2vector/ .
 
 # Run the application
 CMD ["python", "-m", "src.main"]

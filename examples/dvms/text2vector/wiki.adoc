@@ -1,0 +1,141 @@
+= Nostr DVM Kind 5003/6003 — Text‑to‑Vector Embedding Service
+:toc:
+:toclevels: 3
+:source-highlighter: highlight.js
+:sectnums:
+
+== Introduction
+
+This document defines **Kind 5003** and **Kind 6003** events for a Nostr *Data Vending Machine* (DVM) that converts UTF‑8 text strings into fixed‑length numerical embeddings using the `BAAI/bge-large-en‑v1.5` model.
+
+A client publishes a *request* event (Kind 5003) whose `content` is a JSON array of up to 10 text strings.  The DVM replies with a *response* event (Kind 6003) whose `content` is a JSON array of equal length, each element being an array of 1024 float32 numbers representing the L2‑normalised embedding.
+
+These kinds follow the general conventions of <<nip90,NIP‑90>> (*Data Vending Machines*) and the informal patterns emerging in the AI‑oriented DVM ecosystem.  They are new, so no historical tag‑analysis is available yet.
+
+== Kind 5003 — *Text Embedding Request*
+
+=== Purpose
+Send work to an embedding DVM.  The job is fully described by the event itself (no external storage required).
+
+=== Required fields
+
+[options="header"]
+|===
+|Field|Description
+|`kind`|**5003**
+|`content`|JSON‑encoded array (`[]`) of 1 – 10 text strings *(UTF‑8, max 512 tokens each)*.
+|`created_at`|Unix epoch seconds.
+|`pubkey`|Sender’s public key.
+|`sig`|Signature of the event.
+|===
+
+=== Recommended tags
+
+* `relays` + list — relays where the client is listening for a reply.
+* `model` `bge-large-en-v1.5` — desired embedding model.
+* `dim` `1024` — expected embedding dimensionality.
+* `alt` — human‑readable description of the job.
+
+=== Validation rules
+
+* The array length **MUST** be between 1 and 10 (`MAX_BATCH`).
+* Each element **MUST** be a string ≤ 512 tokens after tokenisation.
+* The event **SHOULD** include a `relays` tag so the DVM knows where to publish the response.
+
+=== Example request
+
+[source,json]
+----
+{
+  "id": "<32 hex>",
+  "pubkey": "<32 hex>",
+  "created_at": 1745350000,
+  "kind": 5003,
+  "tags": [
+    ["relays", "wss://relay.dvmdash.live"],
+    ["model", "bge-large-en-v1.5"],
+    ["dim", "1024"],
+    ["alt", "Embedding two demo sentences"]
+  ],
+  "content": "[\"Hello world\",\"How are you?\"]",
+  "sig": "<64 hex>"
+}
+----
+
+== Kind 6003 — *Text Embedding Response*
+
+=== Purpose
+Return embeddings or an error for a Kind 5003 request.
+
+=== Required fields
+
+[options="header"]
+|===
+|Field|Description
+|`kind`|**6003**
+|`content`|JSON array of arrays.  Shape = *N × D*, where *N* equals the number of input strings and *D* equals the value of the `dim` tag (default 1024).  Each element is a float32.
+|`created_at`|Unix epoch seconds.
+|`pubkey`|DVM public key.
+|`sig`|Signature of the event.
+|===
+
+=== Required tags
+
+[options="header"]
+|===
+|Tag|Value|Meaning
+|`e`|`<id>`|Reference to the request event.
+|`status`|`success` \| `error`|Marks outcome.
+|===
+
+=== Recommended tags
+
+* `p` — requester’s pubkey (copied from original event).
+* `model` — e.g. `bge-large-en-v1.5`.
+* `dim` — embedding dimensionality (e.g. `1024`).
+
+=== Error handling
+
+If `status` =`error`, the `content` **SHOULD** be a human‑readable message describing the failure.
+
+=== Example successful response
+
+[source,json]
+----
+{
+  "id": "<32 hex>",
+  "pubkey": "<32 hex>",
+  "created_at": 1745350005,
+  "kind": 6003,
+  "tags": [
+    ["e", "<request‑id>"],
+    ["p", "<requester‑pubkey>"],
+    ["status", "success"],
+    ["model", "bge-large-en-v1.5"],
+    ["dim", "1024"]
+  ],
+  "content": "[[0.1234,0.0567,...,0.0021],[0.0987,...]]",
+  "sig": "<64 hex>"
+}
+----
+
+== Implementation Notes
+
+* Reference implementation: link:https://github.com/your‑repo/text2vector[`text2vector/main.py`] (Python ≈ 3.11, PyTorch, HuggingFace `transformers`).
+* Setting `MAX_BATCH = 10` prevents denial‑of‑service via oversized jobs.
+* Embeddings are L2‑normalised before transmission so they can be compared with cosine similarity via dot product.
+* The DVM publishes to `wss://relay.dvmdash.live` by default but may relay elsewhere.
+
+== Security Considerations
+
+* Clients should validate that the length of `content` matches the number of embeddings returned.
+* Large payloads (JSON arrays of floats) can bloat relays; consider z‑std compression in future revisions.
+* No personally identifying data should be embedded without user consent.
+
+
+== References
+
+* Source: 
+* NIP‑90 — *Data Vending Machines* https://github.com/nostr-protocol/nips/blob/master/90.md
+* BAAI `bge-large-en-v1.5` model card (Apache 2.0) https://huggingface.co/BAAI/bge-large-en-v1.5
+

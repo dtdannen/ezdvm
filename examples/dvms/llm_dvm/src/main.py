@@ -4,19 +4,21 @@ from openai import OpenAI
 from ezdvm import EZDVM
 from nostr_sdk import Event, EventBuilder, Kind, Tag
 
+BASE_URL = "http://host.docker.internal:1234/v1"  # if running in docker container
+# BASE_URL = "http://localhost:1234/v1" # if running locally (not docker)
+
 
 class LLMDVM(EZDVM):
     kinds = [5050]  # Text generation kind
 
     def __init__(self):
         # choose the job request kinds you will listen and respond to
-        super().__init__(kinds=self.kinds)
+        # disable nostr_sdk logging and truncate long event content to prevent cluttering logs
+        super().__init__(kinds=self.kinds, nostr_sdk_log_level=None, log_full_events=False)
 
         try:
             # Initialize connection to LM Studio
-            self.openai_client = OpenAI(
-                base_url="http://localhost:1234/v1", api_key="lm-studio"
-            )
+            self.openai_client = OpenAI(base_url=BASE_URL, api_key="lm-studio")
             self.logger.info("Connected to LM Studio API")
         except Exception as e:
             self.logger.error(f"Failed to connect to LM Studio API: {str(e)}")
@@ -27,7 +29,7 @@ class LLMDVM(EZDVM):
         # Rough estimate: ~4 characters per token for English text
         return len(text) // 4
 
-    def check_token_limit(self, messages, max_tokens=4000):
+    def check_token_limit(self, messages, max_tokens=512):
         """Check if messages exceed token limit."""
         total_text = ""
         for msg in messages:

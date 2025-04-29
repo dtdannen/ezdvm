@@ -28,9 +28,19 @@ load_dotenv()
 
 class EZDVM(ABC):
 
-    def __init__(self, kinds=None, nsec_str=None, ephemeral=False):
-        # Turn on nostr-sdk library logging
-        nostr_sdk.init_logger(LogLevel.DEBUG)
+    def __init__(
+        self,
+        kinds=None,
+        nsec_str=None,
+        ephemeral=False,
+        nostr_sdk_log_level=LogLevel.DEBUG,
+        log_full_events=False,
+    ):
+        # Whether to log full event content or truncate long values
+        self.log_full_events = log_full_events
+        # Turn on nostr-sdk library logging if log level is provided
+        if nostr_sdk_log_level is not None:
+            nostr_sdk.init_logger(nostr_sdk_log_level)
 
         # Remove all existing handlers
         logger.remove()
@@ -205,13 +215,16 @@ class EZDVM(ABC):
                 try:
                     # Try to get the message contents only for more concise logging
                     msg_json = json.loads(msg.as_json())
+                    # Truncate long values in the JSON for better readability, only if self.log_full_events=True
+                    truncated_msg = self.ezdvm_instance._truncate_json(msg_json)
                     self.ezdvm_instance.logger.info(
-                        f"Received message {self.relay_messages_counter} from {relay_url}: {msg_json}"
+                        f"Received message {self.relay_messages_counter} from {relay_url}: {truncated_msg}"
                     )
                 except Exception as e:
-                    # if it fails, just log entire message json
+                    # if it fails, just log entire message json with truncation, only if self.log_full_events=True
+                    truncated_msg = self.ezdvm_instance._truncate_content(str(msg))
                     self.ezdvm_instance.logger.info(
-                        f"Received message {self.relay_messages_counter} from {relay_url}: {msg}"
+                        f"Received message {self.relay_messages_counter} from {relay_url}: {truncated_msg}"
                     )
 
         process_queue_task = asyncio.create_task(self.process_events_off_queue())
@@ -259,8 +272,10 @@ class EZDVM(ABC):
                         f"Starting to work on event {request_event_id_as_hex}"
                     )
                     result_event = await self.do_work(event)
+                    # Truncate the result event for logging, only if self.log_full_events=True
+                    truncated_result = self._truncate_content(str(result_event))
                     self.logger.info(
-                        f"Results from do_work() function are: {result_event}"
+                        f"Results from do_work() function are: {truncated_result}"
                     )
                     self.logger.info(
                         f"Broadcasting DVM Result event with the new results..."
@@ -304,7 +319,9 @@ class EZDVM(ABC):
         :return:
         """
 
-        self.logger.debug(f"Sending job result event: {result_event.as_json()}")
+        # Truncate the event JSON for logging, only if self.log_full_events=True
+        truncated_json = self._truncate_content(result_event.as_json())
+        self.logger.debug(f"Sending job result event: {truncated_json}")
         await self.client.send_event(result_event)
         return result_event
 
@@ -330,8 +347,10 @@ class EZDVM(ABC):
         )
         await self.client.send_event_builder(event_builder)
         feedback_event = event_builder.build(self.keys.public_key())
+        # Truncate the event JSON for logging, only if self.log_full_events=True
+        truncated_json = self._truncate_content(feedback_event.as_json())
         self.logger.debug(
-            f"Send 'processing' feedback event: {feedback_event.as_json()}"
+            f"Send 'processing' feedback event: {truncated_json}"
         )
         return feedback_event
 
@@ -349,6 +368,65 @@ class EZDVM(ABC):
             [Tag.parse(["e", req_event.id().to_hex()]), Tag.parse(["status", "error"])]
         )
         return await builder.sign(self.signer)
+
+    def _truncate_content(self, content, max_length=2000):
+        """
+        Truncate long content for logging purposes.
+
+        Args:
+            content: The content to truncate
+            max_length: Maximum length before truncation
+
+        Returns:
+            str: Truncated content if needed
+        """
+        if (
+            not self.log_full_events
+            and isinstance(content, str)
+            and len(content) > max_length
+        ):
+            return f"{content[:max_length]}... [truncated, {len(content)} chars total]"
+        return content
+
+    def _truncate_json(self, json_obj, max_length=2000):
+        """
+        Truncate long string values in a JSON object for logging purposes.
+
+        Args:
+            json_obj: The JSON object to process
+            max_length: Maximum length for string values before truncation
+
+        Returns:
+            dict/list: JSON object with truncated string values if needed
+        """
+        if self.log_full_events:
+            return json_obj
+
+        if isinstance(json_obj, dict):
+            result = {}
+            for key, value in json_obj.items():
+                if isinstance(value, str) and len(value) > max_length:
+                    result[key] = (
+                        f"{value[:max_length]}... [truncated, {len(value)} chars total]"
+                    )
+                elif isinstance(value, (dict, list)):
+                    result[key] = self._truncate_json(value, max_length)
+                else:
+                    result[key] = value
+            return result
+        elif isinstance(json_obj, list):
+            result = []
+            for item in json_obj:
+                if isinstance(item, str) and len(item) > max_length:
+                    result.append(
+                        f"{item[:max_length]}... [truncated, {len(item)} chars total]"
+                    )
+                elif isinstance(item, (dict, list)):
+                    result.append(self._truncate_json(item, max_length))
+                else:
+                    result.append(item)
+            return result
+        return json_obj
 
     async def shutdown(self):
         self.logger.info("Shutting down EZDVM...")
