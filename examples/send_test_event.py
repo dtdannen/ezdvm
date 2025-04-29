@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
 # send_test_event.py
 import asyncio
 import os
 import sys
-from datetime import timedelta
 import json
+import time
+from datetime import timedelta
 from nostr_sdk import (
     Keys,
     Event,
@@ -26,22 +28,29 @@ from dotenv import load_dotenv
 load_dotenv()
 test_client_nsec = os.getenv("TEST_CLIENT_NSEC")  # nsec1… or raw hex
 
+# Initialize logger
+init_logger(LogLevel.INFO)
+
+# Constants
+MAX_TEST_DURATION = 60  # seconds
+RELAY_URL = "wss://relay.dvmdash.live/"
+
 
 def build_client():
     """
     Build a Client with the keys taken from $TEST_CLIENT_NSEC.
     Works whether the env‑var is a bech32 nsec or a raw 32‑byte hex string.
     """
-    # ① Parse the keys
+    # Parse the keys
     keys = Keys.parse(test_client_nsec)
 
-    print(f"public key : {keys.public_key().to_hex()}")
-    print(f"private key: {keys.secret_key().to_hex()}")
+    print(f"Public key : {keys.public_key().to_hex()}")
+    print(f"Private key: {keys.secret_key().to_hex()}")
 
-    # ② Wrap them in a signer (required since v0.41)
+    # Wrap them in a signer
     signer = NostrSigner.keys(keys)
 
-    # ③ Create the client
+    # Create the client
     return Client(signer)
 
 
@@ -180,227 +189,251 @@ def format_event(event_json):
         return f"Error formatting event: {str(e)}\nRaw event: {event_json}"
 
 
-async def send_and_fetch(kind_request: int, kind_response: int, builder: EventBuilder):
-    """
-    Send an event and fetch related responses.
+class TestResult:
+    """Class to store and display test results."""
 
-    This function:
-    1. Sets up a subscription to listen for responses
-    2. Sends the event
-    3. Waits for responses via subscription
-    4. Also fetches responses via fetch_events
-    5. Combines and returns all related events
+    def __init__(self, test_name: str):
+        self.test_name = test_name
+        self.start_time = time.time()
+        self.request_event_id = None
+        self.received_7000 = False
+        self.received_6003 = False
+        self.received_6050 = False
+        self.received_6055 = False
+        self.time_to_7000 = None
+        self.time_to_6003 = None
+        self.time_to_6050 = None
+        self.time_to_6055 = None
+        self.events = []
+
+    def set_request_id(self, event_id: str):
+        self.request_event_id = event_id
+
+    def add_event(self, event: Event, current_time: float):
+        """Add a received event to the results."""
+        event_kind = event.kind().as_u16()
+        event_id = event.id().to_hex()
+
+        self.events.append(event)
+
+        if event_kind == 7000:
+            self.received_7000 = True
+            self.time_to_7000 = current_time - self.start_time
+        elif event_kind == 6003:
+            self.received_6003 = True
+            self.time_to_6003 = current_time - self.start_time
+        elif event_kind == 6050:
+            self.received_6050 = True
+            self.time_to_6050 = current_time - self.start_time
+        elif event_kind == 6055:
+            self.received_6055 = True
+            self.time_to_6055 = current_time - self.start_time
+
+    def is_complete(self):
+        """Check if we've received both expected event types."""
+        # For text2vector
+        if self.received_7000 and self.received_6003:
+            return True
+        # For LLM
+        if self.received_7000 and self.received_6050:
+            return True
+        # For kind recommender
+        if self.received_7000 and self.received_6055:
+            return True
+        return False
+
+    def format_result(self):
+        """Format the test results for display."""
+        status = "✅ SUCCESS" if self.is_complete() else "❌ FAILED"
+
+        result = [
+            f"=== Test: {self.test_name} - {status} ===",
+            f"Request Event ID: {self.request_event_id}",
+            f"Received kind 7000 (status): {'✓' if self.received_7000 else '✗'}"
+            + (f" (after {self.time_to_7000:.2f}s)" if self.received_7000 else ""),
+        ]
+
+        # Add specific response kinds based on what was received
+        if self.received_6003 or self.test_name.lower().find("text2vector") >= 0:
+            result.append(
+                f"Received kind 6003 (embedding): {'✓' if self.received_6003 else '✗'}"
+                + (f" (after {self.time_to_6003:.2f}s)" if self.received_6003 else "")
+            )
+
+        if self.received_6050 or self.test_name.lower().find("llm") >= 0:
+            result.append(
+                f"Received kind 6050 (llm response): {'✓' if self.received_6050 else '✗'}"
+                + (f" (after {self.time_to_6050:.2f}s)" if self.received_6050 else "")
+            )
+
+        if self.received_6055 or self.test_name.lower().find("kind") >= 0:
+            result.append(
+                f"Received kind 6055 (kind recommender): {'✓' if self.received_6055 else '✗'}"
+                + (f" (after {self.time_to_6055:.2f}s)" if self.received_6055 else "")
+            )
+
+        result.append(f"Total events received: {len(self.events)}")
+
+        return "\n".join(result)
+
+
+class NotificationHandler(HandleNotification):
+    """Handler for Nostr notifications."""
+
+    def __init__(self, event_id: str, result: TestResult):
+        self.event_id = event_id
+        self.result = result
+        self.job_completed = asyncio.Event()
+
+    async def handle(self, relay_url: str, subscription_id: str, ev: Event):
+        event_id_hex = ev.id().to_hex()
+        event_kind = ev.kind().as_u16()
+
+        # Check if this event references our request
+        is_related = False
+        for tag in ev.tags().to_vec():
+            tag_vec = tag.as_vec()
+            if len(tag_vec) >= 2 and tag_vec[0] == "e":
+                if tag_vec[1] == self.event_id:
+                    is_related = True
+                    print(f"Found related event: {event_id_hex} (Kind: {event_kind})")
+                    self.result.add_event(ev, time.time())
+
+                    # If we receive a 6xxx event, signal that the job is completed
+                    if event_kind >= 6000 and event_kind < 7000:
+                        print(
+                            f"Received response event (Kind: {event_kind}), job completed"
+                        )
+                        self.job_completed.set()
+
+                    break
+
+        if not is_related:
+            # Check for other ways it might be related
+            for tag in ev.tags().to_vec():
+                tag_vec = tag.as_vec()
+                if len(tag_vec) >= 2 and tag_vec[0] == "request":
+                    try:
+                        request_data = json.loads(tag_vec[1])
+                        if request_data.get("id") == self.event_id:
+                            is_related = True
+                            print(
+                                f"Found related event via 'request' tag: {event_id_hex}"
+                            )
+                            self.result.add_event(ev, time.time())
+
+                            # If we receive a 6xxx event, signal that the job is completed
+                            if event_kind >= 6000 and event_kind < 7000:
+                                print(
+                                    f"Received response event (Kind: {event_kind}), job completed"
+                                )
+                                self.job_completed.set()
+
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+    async def handle_msg(self, relay_url: str, msg: RelayMessage):
+        if msg.as_enum().is_end_of_stored_events():
+            print(f"Received EOSE from {relay_url}")
+
+
+async def create_text2vector_request():
+    """Create a standard text2vector request event builder."""
+    texts = ["first sentence", "second sentence"]
+    return EventBuilder(Kind(5003), json.dumps(texts, separators=(",", ":"))).tags(
+        [Tag.parse(["n", str(len(texts))])]
+    )
+
+
+async def send_and_fetch(
+    kind_request: int, kind_response: int, builder: EventBuilder, test_name: str = None
+):
+    """
+    Send an event and fetch related responses using the improved subscription approach.
 
     Args:
         kind_request: The kind of the request event
         kind_response: The kind of the expected response event
         builder: The EventBuilder for the request event
+        test_name: Optional name for the test
     """
-    # Create a client
-    keys = Keys.parse(test_client_nsec)
-    signer = NostrSigner.keys(keys)
-    client = Client(signer)
+    if test_name is None:
+        test_name = f"Kind {kind_request} -> {kind_response} Test"
 
-    # Connect to a relay
-    await client.add_relay("wss://relay.dvmdash.live/")
+    result = TestResult(test_name)
+
+    # Create a client
+    client = build_client()
+
+    # Connect to relay
+    await client.add_relay(RELAY_URL)
     await client.connect()
 
     # Set metadata for the client
     await client.set_metadata(Metadata().set_name("SDK test script"))
 
-    # Create a list to store related events found via subscription
-    subscription_events = []
-    event_received = asyncio.Event()
-
-    # Define a notification handler to process events in real-time
-    class NotificationHandler(HandleNotification):
-        async def handle(self, relay_url: str, subscription_id: str, ev: Event):
-            nonlocal event_received, event_id
-            event_id_hex = ev.id().to_hex()
-            event_kind = ev.kind().as_u16()
-            # print(
-            #    f"Received event via subscription from {relay_url} - Kind: {event_kind}, ID: {event_id_hex[:8]}...{event_id_hex[-8:]}"
-            # )
-
-            # Check if this event references our request
-            is_related = False
-            for tag in ev.tags().to_vec():
-                tag_vec = tag.as_vec()
-                if len(tag_vec) >= 2 and tag_vec[0] == "e":
-                    if tag_vec[1] == event_id:
-                        is_related = True
-                        print(
-                            f"Found related event via subscription: {event_id_hex} (Kind: {event_kind})"
-                        )
-                        subscription_events.append(ev)
-                        event_received.set()
-                        break
-
-            # If not found via 'e' tag, check for other ways it might be related
-            if not is_related:
-                # Check for "request" tag (as mentioned in NIP-90)
-                for tag in ev.tags().to_vec():
-                    tag_vec = tag.as_vec()
-                    if len(tag_vec) >= 2 and tag_vec[0] == "request":
-                        try:
-                            # The request tag might contain the stringified JSON of the original request
-                            request_data = json.loads(tag_vec[1])
-                            if request_data.get("id") == event_id:
-                                is_related = True
-                                print(
-                                    f"Found related event via 'request' tag: {event_id_hex}"
-                                )
-                                subscription_events.append(ev)
-                                event_received.set()
-                                break
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-
-            if not is_related:
-                # Only print unrelated events if they have an 'e' tag
-                for tag in ev.tags().to_vec():
-                    tag_vec = tag.as_vec()
-                    if len(tag_vec) >= 2 and tag_vec[0] == "e":
-                        # print(f"Subscription: unrelated event with tag {tag_vec[1]}")
-                        break
-
-        async def handle_msg(self, relay_url: str, msg: RelayMessage):
-            # Just log the message type
-            if msg.as_enum().is_event_msg():
-                # print(f"Received EVENT message from {relay_url}")
-                pass
-            elif msg.as_enum().is_end_of_stored_events():
-                print(f"Received EOSE from {relay_url}")
-
-    # First, build the event to get its ID (but don't send it yet)
-    print("Building event to get ID...")
-    # Create an unsigned event to get its ID
-    unsigned_event = builder.build(keys.public_key())
-    event_id = unsigned_event.id().to_hex()
-    print(f"Event ID will be: {event_id}")
-
-    # Set up a subscription with a wide time window (1 hour)
-    print("Setting up subscription for responses...")
-    one_hour_ago = Timestamp.from_secs(Timestamp.now().as_secs() - 3600)
-
-    # Now send the event
+    # Build and send the event
     print("Sending event...")
     output = await client.send_event_builder(builder)
-    # Verify the event ID matches what we expected
-    if event_id != output.id.to_hex():
-        print(f"Warning: Event ID changed from {event_id} to {output.id.to_hex()}")
-        event_id = output.id.to_hex()
+    event_id = output.id.to_hex()
+    result.set_request_id(event_id)
+
+    print(f"\n=== Running Test: {result.test_name} ===")
     print(f"Event sent with ID: {event_id}")
     print(f"Sent to: {output.success}")
     print(f"Not sent to: {output.failed}")
 
-    print("Sleeping a bit before doing subscription")
-    await asyncio.sleep(3)
-
-    # Set up a subscription for the response kinds
-    print("Setting up subscription for response kinds...")
-    # Filter for events of the response kinds
-    # response_filter = Filter().kinds([Kind(kind_response), Kind(7000)]).event(output.id)
-    response_filter = Filter().event(output.id)
+    # Set up subscription with a 1-hour time window
+    print("Setting up subscription with 1-hour time window...")
+    one_hour_ago = Timestamp.from_secs(Timestamp.now().as_secs() - 3600)
+    response_filter = Filter().event(output.id).since(one_hour_ago)
     await client.subscribe(response_filter)
 
-    # Start handling notifications in the background
-    notification_task = asyncio.create_task(
-        client.handle_notifications(NotificationHandler())
-    )
+    # Start notification handler
+    handler = NotificationHandler(event_id, result)
+    notification_task = asyncio.create_task(client.handle_notifications(handler))
 
-    # Wait for events to arrive via subscription
-    wait_time = 20
-    print(f"Waiting up to {wait_time} seconds for events via subscription...")
+    # Wait for either job completion or timeout
+    print(f"Waiting up to {MAX_TEST_DURATION} seconds for responses...")
     try:
-        await asyncio.wait_for(event_received.wait(), timeout=wait_time)
-        print("Event received via subscription!")
+        # Wait for either the job to complete or the timeout to occur
+        await asyncio.wait_for(handler.job_completed.wait(), timeout=MAX_TEST_DURATION)
+        print("Job completed, received response event")
     except asyncio.TimeoutError:
-        print("No events received via subscription within the timeout period")
+        print(
+            f"Timeout after {MAX_TEST_DURATION} seconds without receiving a response event"
+        )
 
-    # Cancel the notification handler task
+    # Cancel notification handler
     notification_task.cancel()
     try:
         await notification_task
     except asyncio.CancelledError:
         pass
 
-    # Also try fetch_events with a wide time window
-    print("Getting events from relays via fetch_events...")
-    # flt = Filter().kinds([Kind(kind_response), Kind(7000)]).event(output.id)
-    flt = Filter().event(output.id)
-    events = await client.fetch_events(flt, timedelta(seconds=3600))
-
-    events_vec = events.to_vec()
-    if not events_vec:
-        print("No events received via fetch_events.")
-    else:
-        print(f"Received {len(events_vec)} events via fetch_events")
-
-        # Process events from fetch_events
-        fetch_related_events = []
-        for ev in events_vec:
-            # Check if this event references our event
-            is_related = False
-            for tag in ev.tags().to_vec():
-                tag_vec = tag.as_vec()
-                if len(tag_vec) >= 2 and tag_vec[0] == "e" and tag_vec[1] == event_id:
-                    is_related = True
-                    print(f"Found related event via fetch: {ev.id().to_hex()}")
-                    fetch_related_events.append(ev)
-                    break
-
-            # Also check for "request" tag (as mentioned in NIP-90)
-            if not is_related:
-                for tag in ev.tags().to_vec():
-                    tag_vec = tag.as_vec()
-                    if len(tag_vec) >= 2 and tag_vec[0] == "request":
-                        try:
-                            # The request tag might contain the stringified JSON of the original request
-                            request_data = json.loads(tag_vec[1])
-                            if request_data.get("id") == event_id:
-                                is_related = True
-                                print(
-                                    f"Found related event via 'request' tag: {ev.id().to_hex()}"
-                                )
-                                break
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-
-        if not fetch_related_events:
-            print("No related events found via fetch_events.")
-
-    # Combine all found events
-    all_related_events = []
-
-    # Add subscription events
-    for ev in subscription_events:
-        event_id_hex = ev.id().to_hex()
-        if not any(e.id().to_hex() == event_id_hex for e in all_related_events):
-            all_related_events.append(ev)
-
-    # Add fetch events
-    if "fetch_related_events" in locals():
-        for ev in fetch_related_events:
-            event_id_hex = ev.id().to_hex()
-            if not any(e.id().to_hex() == event_id_hex for e in all_related_events):
-                all_related_events.append(ev)
-
     # Display results
-    if not all_related_events:
-        print("No related events received from either subscription or fetch.")
-    else:
-        print(f"Found {len(all_related_events)} related events in total:")
-        for ev in all_related_events:
+    print(result.format_result())
+
+    # Display received events
+    if result.events:
+        print("\nReceived Events:")
+        for ev in result.events:
             print(format_event(ev.as_json()))
 
-    return all_related_events
+    await client.disconnect()
+    return result.events
 
 
-async def test_5050():
-    message = "Hello this is a test"
-    builder = EventBuilder(Kind(5050), message)
-    await send_and_fetch(5050, 6050, builder)
+async def test_5003():
+    """Test the text2vector DVM with a simple embedding request."""
+    builder = await create_text2vector_request()
+    await send_and_fetch(
+        kind_request=5003,
+        kind_response=6003,
+        builder=builder,
+        test_name="Text2Vector Test",
+    )
 
 
 async def test_5050_llm():
@@ -413,23 +446,11 @@ async def test_5050_llm():
     }
 
     builder = EventBuilder(Kind(5050), json.dumps(message_json)).tags(
-        [Tag.parse(["t", "temperature", "0.7"]), Tag.parse(["m", "max_tokens", "100"])]
+        [Tag.parse(["t", "temperature", "0.7"]), Tag.parse(["m", "max_tokens", "1000"])]
     )
 
-    await send_and_fetch(5050, 6050, builder)
-
-
-async def test_5003():
-    """Test the text2vector DVM with a simple embedding request."""
-    texts = ["first sentence", "second sentence"]  # ≤10 items
-    builder = EventBuilder(Kind(5003), json.dumps(texts, separators=(",", ":"))).tags(
-        [Tag.parse(["n", str(len(texts))])]
-    )  # optional metadata
-
     await send_and_fetch(
-        kind_request=5003,
-        kind_response=6003,
-        builder=builder,
+        kind_request=5050, kind_response=6050, builder=builder, test_name="LLM Test"
     )
 
 
@@ -441,7 +462,12 @@ async def test_5055_kind_recommender():
     # Create a simple event with the query as content
     builder = EventBuilder(Kind(5055), query)
 
-    await send_and_fetch(5055, 6055, builder)
+    await send_and_fetch(
+        kind_request=5055,
+        kind_response=6055,
+        builder=builder,
+        test_name="Kind Recommender Test",
+    )
 
 
 async def find_related_events(event_id: str, kind_response: int):
@@ -451,136 +477,55 @@ async def find_related_events(event_id: str, kind_response: int):
     """
     print(f"\n=== SANITY CHECK: Looking for events related to {event_id} ===")
 
-    # Get the keys and create a client
-    keys = Keys.parse(test_client_nsec)
-    signer = NostrSigner.keys(keys)
-    client = Client(signer)
+    # Create a client
+    client = build_client()
 
-    # Connect to a relay
-    await client.add_relay("wss://relay.dvmdash.live/")
+    # Connect to relay
+    await client.add_relay(RELAY_URL)
     await client.connect()
 
-    # Create a list to store related events
-    related_events = []
-    event_received = asyncio.Event()
+    # Create a test result to track events
+    result = TestResult("Sanity Check")
+    result.set_request_id(event_id)
 
-    # Define a notification handler
-    class NotificationHandler(HandleNotification):
-        async def handle(self, relay_url: str, subscription_id: str, ev: Event):
-            print(f"Sanity check: Received event via subscription from {relay_url}")
-
-            # Check if this event references our request
-            is_related = False
-            for tag in ev.tags().to_vec():
-                tag_vec = tag.as_vec()
-                if len(tag_vec) >= 2 and tag_vec[0] == "e":
-                    if tag_vec[1] == event_id:
-                        is_related = True
-                        print(f"Sanity check: Found related event: {ev.id().to_hex()}")
-                        related_events.append(ev)
-                        event_received.set()
-                        break
-
-            if not is_related:
-                print(f"Sanity check: Received unrelated event: {ev.id().to_hex()}")
-
-        async def handle_msg(self, relay_url: str, msg: RelayMessage):
-            if msg.as_enum().is_event_msg():
-                # print(f"Sanity check: Received EVENT message from {relay_url}")
-                pass
-            elif msg.as_enum().is_end_of_stored_events():
-                # print(f"Sanity check: Received EOSE from {relay_url}")
-                pass
-
-    # Set up a subscription with a very wide time window (1 hour)
+    # Set up subscription with a 1-hour time window
     print("Sanity check: Setting up subscription...")
     one_hour_ago = Timestamp.from_secs(Timestamp.now().as_secs() - 3600)
-
-    # Filter for events of the response kinds
-    # response_filter = Filter().kinds([Kind(kind_response), Kind(7000)])
-    # ANCHOR: format-parse-hex
-    # To Hex and then Parse
-    response_filter = Filter().event(EventId.parse(event_id))
+    response_filter = Filter().event(EventId.parse(event_id)).since(one_hour_ago)
     await client.subscribe(response_filter)
 
-    # Start handling notifications
-    notification_task = asyncio.create_task(
-        client.handle_notifications(NotificationHandler())
-    )
+    # Start notification handler
+    handler = NotificationHandler(event_id, result)
+    notification_task = asyncio.create_task(client.handle_notifications(handler))
 
-    # Wait for events
-    wait_time = 20
+    # Wait for either job completion or timeout
+    wait_time = MAX_TEST_DURATION
     print(f"Sanity check: Waiting up to {wait_time} seconds for events...")
     try:
-        await asyncio.wait_for(event_received.wait(), timeout=wait_time)
-        print("Sanity check: Event received!")
+        # Wait for either the job to complete or the timeout to occur
+        await asyncio.wait_for(handler.job_completed.wait(), timeout=wait_time)
+        print("Sanity check: Job completed, received response event")
     except asyncio.TimeoutError:
-        print("Sanity check: No events received within the timeout period")
+        print(
+            f"Sanity check: Timeout after {wait_time} seconds without receiving a response event"
+        )
 
-    # Cancel the notification handler task
+    # Cancel notification handler
     notification_task.cancel()
     try:
         await notification_task
     except asyncio.CancelledError:
         pass
 
-    # Also try fetch_events with a wide time window
-    print("Sanity check: Trying fetch_events...")
-    flt = Filter().kinds([Kind(kind_response), Kind(7000)])
-    events = await client.fetch_events(flt, timedelta(seconds=3600))
-
-    events_vec = events.to_vec()
-    if not events_vec:
-        print("Sanity check: No events received via fetch_events.")
-    else:
-        print(f"Sanity check: Received {len(events_vec)} events via fetch_events")
-
-        # Process events from fetch_events
-        fetch_related_events = []
-        for ev in events_vec:
-            # Check if this event references our event
-            is_related = False
-            for tag in ev.tags().to_vec():
-                tag_vec = tag.as_vec()
-                if len(tag_vec) >= 2 and tag_vec[0] == "e" and tag_vec[1] == event_id:
-                    is_related = True
-                    print(
-                        f"Sanity check: Found related event via fetch: {ev.id().to_hex()}"
-                    )
-                    fetch_related_events.append(ev)
-                    break
-
-        if not fetch_related_events:
-            print("Sanity check: No related events found via fetch_events.")
-        else:
-            print(
-                f"Sanity check: Found {len(fetch_related_events)} related events via fetch_events"
-            )
-
-    # Combine all found events
-    all_related_events = []
-
-    # Add subscription events
-    for ev in related_events:
-        event_id_hex = ev.id().to_hex()
-        if not any(e.id().to_hex() == event_id_hex for e in all_related_events):
-            all_related_events.append(ev)
-
-    # Add fetch events
-    if "fetch_related_events" in locals():
-        for ev in fetch_related_events:
-            event_id_hex = ev.id().to_hex()
-            if not any(e.id().to_hex() == event_id_hex for e in all_related_events):
-                all_related_events.append(ev)
-
     # Display results
-    if not all_related_events:
-        print("Sanity check: No related events found at all.")
+    if not result.events:
+        print("Sanity check: No related events found.")
     else:
-        print(f"Sanity check: Found {len(all_related_events)} related events in total:")
-        for ev in all_related_events:
+        print(f"Sanity check: Found {len(result.events)} related events:")
+        for ev in result.events:
             print(format_event(ev.as_json()))
 
+    await client.disconnect()
     print("=== END SANITY CHECK ===\n")
 
 

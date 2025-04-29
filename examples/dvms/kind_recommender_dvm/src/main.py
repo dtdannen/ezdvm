@@ -8,6 +8,7 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 import sys
 import os
+import time
 from dotenv import load_dotenv
 
 from ezdvm import EZDVM
@@ -21,6 +22,8 @@ from nostr_sdk import (
     NostrSigner,
     Filter,
     Timestamp,
+    HandleNotification,
+    RelayMessage,
 )
 
 # Set up logging
@@ -129,6 +132,48 @@ class KindRecommenderDVM(EZDVM):
             5999: "Kind 5999 events represent requests made to a Data Vending Machine (DVM) for computational resources. The input for a kind 5999 event includes parameters such as CPU, memory, disk, SSH key, OS image, and OS version, which are specified using tagged data. The output of a kind 5999 event is typically a kind 7000 event that provides feedback on the status of the request, including whether payment is required, an expiration timestamp, and potentially an invoice for payment.",
         }
 
+    class NotificationHandler(HandleNotification):
+        """Handler for Nostr notifications."""
+        
+        def __init__(self, event_id, logger, received_events=None):
+            self.event_id = event_id
+            self.logger = logger
+            self.received_events = received_events if received_events is not None else []
+        
+        async def handle(self, relay_url, subscription_id, ev):
+            event_id_hex = ev.id().to_hex()
+            event_kind = ev.kind().as_u16()
+            
+            # Check if this event references our request
+            is_related = False
+            for tag in ev.tags().to_vec():
+                tag_vec = tag.as_vec()
+                if len(tag_vec) >= 2 and tag_vec[0] == "e":
+                    if tag_vec[1] == self.event_id:
+                        is_related = True
+                        self.logger.info(f"Found related event: {event_id_hex} (Kind: {event_kind})")
+                        self.received_events.append(ev)
+                        break
+            
+            if not is_related:
+                # Check for other ways it might be related
+                for tag in ev.tags().to_vec():
+                    tag_vec = tag.as_vec()
+                    if len(tag_vec) >= 2 and tag_vec[0] == "request":
+                        try:
+                            request_data = json.loads(tag_vec[1])
+                            if request_data.get("id") == self.event_id:
+                                is_related = True
+                                self.logger.info(f"Found related event via 'request' tag: {event_id_hex}")
+                                self.received_events.append(ev)
+                                break
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+        
+        async def handle_msg(self, relay_url, msg):
+            if msg.as_enum().is_end_of_stored_events():
+                self.logger.info(f"Received EOSE from {relay_url}")
+
     async def get_embeddings(self, texts):
         """
         Get embeddings for texts by sending a request to the text2vector DVM
@@ -162,132 +207,103 @@ class KindRecommenderDVM(EZDVM):
         # Send the request
         self.logger.info("Sending request to text2vector DVM...")
         try:
-            await self.client.send_event_builder(builder)
-            request_event = builder.build(self.client_keys.public_key())
-            request_id = request_event.id().to_hex()
+            output = await self.client.send_event_builder(builder)
+            request_id = output.id.to_hex()
             self.logger.info(f"Sent embedding request with ID: {request_id}")
         except Exception as e:
             self.logger.error(f"Error sending embedding request: {str(e)}", exc_info=True)
             raise Exception(f"Failed to send embedding request: {str(e)}")
 
-        # Wait for the response
-        self.logger.info("Waiting for response from text2vector DVM...")
-        request_id = request_event.id().to_hex()
-        self.logger.info(f"Looking for events with e tag matching request ID: {request_id}")
+        # Wait for the response using subscription with a 1-hour time window
+        self.logger.info("Setting up subscription with 1-hour time window...")
+        one_hour_ago = Timestamp.from_secs(Timestamp.now().as_secs() - 3600)
+        response_filter = Filter().event(output.id).since(one_hour_ago)
         
-        # Create a more general filter first to see what events are available
-        general_filter = Filter().kinds([Kind(6003)])
-        
-        # Try multiple times with increasing timeouts
-        for attempt in range(3):
-            timeout = 5 * (attempt + 1)  # 5, 10, 15 seconds
-            self.logger.info(f"Attempt {attempt+1}/3 with timeout {timeout} seconds")
+        try:
+            await self.client.subscribe(response_filter)
             
+            # Set up notification handler
+            received_events = []
+            handler = self.NotificationHandler(request_id, self.logger, received_events)
+            notification_task = asyncio.create_task(self.client.handle_notifications(handler))
+            
+            # Wait for response with timeout
+            max_wait_time = 60  # seconds - increased from 15 to give more time for response
+            self.logger.info(f"Waiting up to {max_wait_time} seconds for responses...")
+            
+            # Wait and check periodically if we've received any events
+            start_time = time.time()
+            response_event = None
+            
+            while time.time() - start_time < max_wait_time:
+                await asyncio.sleep(1)  # Check every second
+                
+                # Look for kind 6003 events in received events
+                for ev in received_events:
+                    event_kind = ev.kind().as_u16()
+                    self.logger.info(f"Checking event with kind: {event_kind}")
+                    if event_kind == 6003:
+                        response_event = ev
+                        self.logger.info(f"Found response event with kind 6003")
+                        break
+                
+                if response_event:
+                    break
+            
+            # Cancel notification handler
+            notification_task.cancel()
             try:
-                # First, check for any kind 6003 events to see what's available
-                self.logger.info(f"Checking for any kind 6003 events with general filter: {general_filter}")
-                general_events = await self.client.fetch_events(
-                    general_filter, timedelta(seconds=timeout)
-                )
+                await notification_task
+            except asyncio.CancelledError:
+                pass
+            
+            # Process the response if we got one
+            if response_event:
+                response_id = response_event.id().to_hex()
+                self.logger.info(f"Received embedding response with ID: {response_id}")
                 
-                self.logger.info(f"Found {general_events.len()} general kind 6003 events")
+                # Check if the response has the expected tags
+                tags = response_event.tags().to_vec()
+                tag_dict = {}
+                for tag in tags:
+                    tag_parts = tag.as_vec()
+                    if len(tag_parts) >= 2:
+                        tag_dict[tag_parts[0]] = tag_parts[1]
                 
-                # Log details of any events found
-                if general_events.len() > 0:
-                    for ev in general_events.to_vec():
-                        ev_id = ev.id().to_hex()
-                        ev_author = ev.author().to_hex()
-                        
-                        # Extract tags
-                        tags = ev.tags().to_vec()
-                        tag_dict = {}
-                        for tag in tags:
-                            tag_parts = tag.as_vec()
-                            if len(tag_parts) >= 2:
-                                tag_name = tag_parts[0]
-                                tag_value = tag_parts[1]
-                                if tag_name in tag_dict:
-                                    if isinstance(tag_dict[tag_name], list):
-                                        tag_dict[tag_name].append(tag_value)
-                                    else:
-                                        tag_dict[tag_name] = [tag_dict[tag_name], tag_value]
-                                else:
-                                    tag_dict[tag_name] = tag_value
-                        
-                        self.logger.info(f"Event {ev_id} from {ev_author} with tags: {tag_dict}")
-                        
-                        # Check if this event references our request
-                        if 'e' in tag_dict and tag_dict['e'] == request_id:
-                            self.logger.info(f"Found matching event with ID: {ev_id}")
+                self.logger.debug(f"Response tags: {tag_dict}")
                 
-                # Now try with the specific filter
-                response_filter = Filter().kinds([Kind(6003)]).event(request_event.id())
-                self.logger.info(f"Using specific filter: {response_filter}")
-                events = await self.client.fetch_events(
-                    response_filter, timedelta(seconds=timeout)
-                )
+                # Check status tag
+                if "status" in tag_dict and tag_dict["status"] != "success":
+                    self.logger.warning(f"Response status is not success: {tag_dict['status']}")
+                    raise Exception(f"Text2vector DVM returned status: {tag_dict['status']}")
                 
-                self.logger.info(f"Received {events.len()} events with specific filter")
-                
-                if events.len() > 0:
-                    response_event = events.to_vec()[0]
-                    response_id = response_event.id().to_hex()
-                    self.logger.info(f"Received embedding response with ID: {response_id}")
+                # Parse the embeddings from the response
+                try:
+                    content = response_event.content()
+                    content_size = len(content)
+                    self.logger.info(f"Response content size: {content_size} bytes")
                     
-                    # Check if the response has the expected tags
-                    tags = response_event.tags().to_vec()
-                    tag_dict = {}
-                    for tag in tags:
-                        tag_parts = tag.as_vec()
-                        if len(tag_parts) >= 2:
-                            tag_dict[tag_parts[0]] = tag_parts[1]
-                    
-                    self.logger.debug(f"Response tags: {tag_dict}")
-                    
-                    # Check status tag
-                    if "status" in tag_dict and tag_dict["status"] != "success":
-                        self.logger.warning(f"Response status is not success: {tag_dict['status']}")
-                        if attempt == 2:  # Last attempt
-                            raise Exception(f"Text2vector DVM returned status: {tag_dict['status']}")
-                        continue
-                    
-                    # Parse the embeddings from the response
-                    try:
-                        content = response_event.content()
-                        content_size = len(content)
-                        self.logger.info(f"Response content size: {content_size} bytes")
+                    if content_size == 0:
+                        self.logger.error("Empty response content")
+                        raise Exception("Empty response content from text2vector DVM")
                         
-                        if content_size == 0:
-                            self.logger.error("Empty response content")
-                            if attempt == 2:  # Last attempt
-                                raise Exception("Empty response content from text2vector DVM")
-                            continue
-                            
-                        embeddings = json.loads(content)
-                        if not isinstance(embeddings, list):
-                            self.logger.error(f"Unexpected embeddings format: {type(embeddings)}")
-                            if attempt == 2:  # Last attempt
-                                raise Exception(f"Unexpected embeddings format: {type(embeddings)}")
-                            continue
-                            
-                        self.logger.info(f"Successfully parsed embeddings: shape {len(embeddings)}x{len(embeddings[0]) if embeddings and isinstance(embeddings[0], list) else '?'}")
-                        return np.array(embeddings)
-                    except json.JSONDecodeError as e:
-                        self.logger.error(f"JSON decode error: {str(e)}")
-                        if attempt == 2:  # Last attempt
-                            raise Exception(f"Failed to parse response: {str(e)}")
-                        continue
-                else:
-                    self.logger.warning(f"No events received for attempt {attempt+1}")
-            except Exception as e:
-                self.logger.error(
-                    f"Error fetching embedding response (attempt {attempt+1}): {str(e)}",
-                    exc_info=True
-                )
-
-        # If we get here, we failed to get a response
-        self.logger.error("Failed to get embedding response after multiple attempts")
-        raise Exception("Failed to get embedding response from text2vector DVM")
+                    embeddings = json.loads(content)
+                    if not isinstance(embeddings, list):
+                        self.logger.error(f"Unexpected embeddings format: {type(embeddings)}")
+                        raise Exception(f"Unexpected embeddings format: {type(embeddings)}")
+                        
+                    self.logger.info(f"Successfully parsed embeddings: shape {len(embeddings)}x{len(embeddings[0]) if embeddings and isinstance(embeddings[0], list) else '?'}")
+                    return np.array(embeddings)
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"JSON decode error: {str(e)}")
+                    raise Exception(f"Failed to parse response: {str(e)}")
+            else:
+                self.logger.error("No response received within the timeout period")
+                raise Exception("No response received from text2vector DVM within the timeout period")
+                
+        except Exception as e:
+            self.logger.error(f"Error getting embedding response: {str(e)}", exc_info=True)
+            raise Exception(f"Failed to get embedding response: {str(e)}")
 
     async def generate_llm_response(
         self, prompt, system_prompt=None, temperature=0.7, max_tokens=500
@@ -324,38 +340,69 @@ class KindRecommenderDVM(EZDVM):
         )
 
         # Send the request
-        await self.client.send_event_builder(builder)
-        request_event = builder.build(self.client_keys.public_key())
-        request_id = request_event.id().to_hex()
-        self.logger.info(f"Sent LLM request with ID: {request_id}")
+        self.logger.info("Sending request to LLM DVM...")
+        try:
+            output = await self.client.send_event_builder(builder)
+            request_id = output.id.to_hex()
+            self.logger.info(f"Sent LLM request with ID: {request_id}")
+        except Exception as e:
+            self.logger.error(f"Error sending LLM request: {str(e)}", exc_info=True)
+            raise Exception(f"Failed to send LLM request: {str(e)}")
 
-        # Wait for the response
-        self.logger.info("Waiting for response from LLM DVM...")
-        response_filter = Filter().kinds([Kind(6050)]).event(request_event.id())
-
-        # Try multiple times with increasing timeouts
-        for attempt in range(3):
-            timeout = 10 * (attempt + 1)  # 10, 20, 30 seconds
+        # Wait for the response using subscription with a 1-hour time window
+        self.logger.info("Setting up subscription with 1-hour time window...")
+        one_hour_ago = Timestamp.from_secs(Timestamp.now().as_secs() - 3600)
+        response_filter = Filter().event(output.id).since(one_hour_ago)
+        
+        try:
+            await self.client.subscribe(response_filter)
+            
+            # Set up notification handler
+            received_events = []
+            handler = self.NotificationHandler(request_id, self.logger, received_events)
+            notification_task = asyncio.create_task(self.client.handle_notifications(handler))
+            
+            # Wait for response with timeout
+            max_wait_time = 30  # seconds (longer for LLM responses)
+            self.logger.info(f"Waiting up to {max_wait_time} seconds for responses...")
+            
+            # Wait and check periodically if we've received any events
+            start_time = time.time()
+            response_event = None
+            
+            while time.time() - start_time < max_wait_time:
+                await asyncio.sleep(1)  # Check every second
+                
+                # Look for kind 6050 events in received events
+                for ev in received_events:
+                    if ev.kind().as_u16() == 6050:
+                        response_event = ev
+                        break
+                
+                if response_event:
+                    break
+            
+            # Cancel notification handler
+            notification_task.cancel()
             try:
-                events = await self.client.fetch_events(
-                    response_filter, timedelta(seconds=timeout)
-                )
-                if events.len() > 0:
-                    response_event = events.to_vec()[0]
-                    self.logger.info(
-                        f"Received LLM response: {response_event.id().to_hex()}"
-                    )
-
-                    # The content of the response is the generated text
-                    return response_event.content()
-            except Exception as e:
-                self.logger.error(
-                    f"Error fetching LLM response (attempt {attempt+1}): {e}"
-                )
-
-        # If we get here, we failed to get a response
-        self.logger.error("Failed to get LLM response after multiple attempts")
-        raise Exception("Failed to get LLM response from LLM DVM")
+                await notification_task
+            except asyncio.CancelledError:
+                pass
+            
+            # Process the response if we got one
+            if response_event:
+                response_id = response_event.id().to_hex()
+                self.logger.info(f"Received LLM response with ID: {response_id}")
+                
+                # The content of the response is the generated text
+                return response_event.content()
+            else:
+                self.logger.error("No LLM response received within the timeout period")
+                raise Exception("No response received from LLM DVM within the timeout period")
+                
+        except Exception as e:
+            self.logger.error(f"Error getting LLM response: {str(e)}", exc_info=True)
+            raise Exception(f"Failed to get LLM response: {str(e)}")
 
     def search(self, query, embeddings, texts, top_k=10):
         """
@@ -757,8 +804,8 @@ Explanation for Developer:
             # Generate the recommendation
             recommendation = await self.improved_kind_recommendation(query)
 
-            # Create the response event
-            builder = EventBuilder(Kind(6999), recommendation).tags(
+            # Create the response event with kind 6055 (kind recommender response)
+            builder = EventBuilder(Kind(6055), recommendation).tags(
                 [
                     Tag.parse(["e", event.id().to_hex()]),
                     Tag.parse(["status", "success"]),
