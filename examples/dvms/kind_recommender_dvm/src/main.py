@@ -24,6 +24,7 @@ from nostr_sdk import (
     Timestamp,
     HandleNotification,
     RelayMessage,
+    LogLevel,
 )
 
 # Set up logging
@@ -38,8 +39,75 @@ logger = logging.getLogger("kind_recommender_dvm")
 load_dotenv()
 
 # Constants
-MAX_BATCH = 10  # safety guard for text2vector DVM
+MAX_BATCH = 3  # safety guard for text2vector DVM
 DEFAULT_KIND = 5055  # Default kind for this DVM
+
+
+class NotificationHandler(HandleNotification):
+    """Handler for Nostr notifications."""
+
+    def __init__(self, event_id, logger, received_events=None):
+        self.event_id = event_id
+        self.logger = logger
+        self.received_events = received_events if received_events is not None else []
+        self.job_result_event = None
+        self.job_completed = asyncio.Event()
+
+    async def handle(self, relay_url, subscription_id, ev):
+        event_id_hex = ev.id().to_hex()
+        event_kind = ev.kind().as_u16()
+
+        # Check if this event references our request
+        is_related = False
+        for tag in ev.tags().to_vec():
+            tag_vec = tag.as_vec()
+            if len(tag_vec) >= 2 and tag_vec[0] == "e":
+                if tag_vec[1] == self.event_id:
+                    is_related = True
+                    self.logger.info(
+                        f"Found related event: {event_id_hex} (Kind: {event_kind})"
+                    )
+                    self.received_events.append(ev)
+
+                    # If we receive a 6xxx event, signal that the job is completed
+                    if event_kind >= 6000 and event_kind < 7000:
+                        print(
+                            f"Received response event (Kind: {event_kind}), job completed"
+                        )
+                        self.job_result_event = ev
+                        self.job_completed.set()
+
+                    break
+
+        if not is_related:
+            # Check for other ways it might be related
+            for tag in ev.tags().to_vec():
+                tag_vec = tag.as_vec()
+                if len(tag_vec) >= 2 and tag_vec[0] == "request":
+                    try:
+                        request_data = json.loads(tag_vec[1])
+                        if request_data.get("id") == self.event_id:
+                            is_related = True
+                            self.logger.info(
+                                f"Found related event via 'request' tag: {event_id_hex}"
+                            )
+                            self.received_events.append(ev)
+
+                            # If we receive a 6xxx event, signal that the job is completed
+                            if event_kind >= 6000 and event_kind < 7000:
+                                print(
+                                    f"Received response event (Kind: {event_kind}), job completed"
+                                )
+                                self.job_result_event = ev
+                                self.job_completed.set()
+
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+    async def handle_msg(self, relay_url, msg):
+        if msg.as_enum().is_end_of_stored_events():
+            self.logger.info(f"Received EOSE from {relay_url}")
 
 
 class KindRecommenderDVM(EZDVM):
@@ -48,7 +116,9 @@ class KindRecommenderDVM(EZDVM):
     def __init__(self):
         # Choose the job request kinds you will listen and respond to
         # disable nostr_sdk logging and truncate long event content to prevent cluttering logs
-        super().__init__(kinds=self.kinds, nostr_sdk_log_level=None, log_full_events=False)
+        super().__init__(
+            kinds=self.kinds, nostr_sdk_log_level=LogLevel.INFO, log_full_events=False
+        )
         self.kind_descriptions = {}
         self.embeddings = None
         self.client_keys = None
@@ -132,48 +202,6 @@ class KindRecommenderDVM(EZDVM):
             5999: "Kind 5999 events represent requests made to a Data Vending Machine (DVM) for computational resources. The input for a kind 5999 event includes parameters such as CPU, memory, disk, SSH key, OS image, and OS version, which are specified using tagged data. The output of a kind 5999 event is typically a kind 7000 event that provides feedback on the status of the request, including whether payment is required, an expiration timestamp, and potentially an invoice for payment.",
         }
 
-    class NotificationHandler(HandleNotification):
-        """Handler for Nostr notifications."""
-        
-        def __init__(self, event_id, logger, received_events=None):
-            self.event_id = event_id
-            self.logger = logger
-            self.received_events = received_events if received_events is not None else []
-        
-        async def handle(self, relay_url, subscription_id, ev):
-            event_id_hex = ev.id().to_hex()
-            event_kind = ev.kind().as_u16()
-            
-            # Check if this event references our request
-            is_related = False
-            for tag in ev.tags().to_vec():
-                tag_vec = tag.as_vec()
-                if len(tag_vec) >= 2 and tag_vec[0] == "e":
-                    if tag_vec[1] == self.event_id:
-                        is_related = True
-                        self.logger.info(f"Found related event: {event_id_hex} (Kind: {event_kind})")
-                        self.received_events.append(ev)
-                        break
-            
-            if not is_related:
-                # Check for other ways it might be related
-                for tag in ev.tags().to_vec():
-                    tag_vec = tag.as_vec()
-                    if len(tag_vec) >= 2 and tag_vec[0] == "request":
-                        try:
-                            request_data = json.loads(tag_vec[1])
-                            if request_data.get("id") == self.event_id:
-                                is_related = True
-                                self.logger.info(f"Found related event via 'request' tag: {event_id_hex}")
-                                self.received_events.append(ev)
-                                break
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-        
-        async def handle_msg(self, relay_url, msg):
-            if msg.as_enum().is_end_of_stored_events():
-                self.logger.info(f"Received EOSE from {relay_url}")
-
     async def get_embeddings(self, texts):
         """
         Get embeddings for texts by sending a request to the text2vector DVM
@@ -187,7 +215,9 @@ class KindRecommenderDVM(EZDVM):
         self.logger.info(
             f"Getting embeddings for {len(texts)} texts via text2vector DVM"
         )
-        self.logger.debug(f"Text samples: {[t[:50] + '...' if len(t) > 50 else t for t in texts[:2]]}")
+        self.logger.debug(
+            f"Text samples: {[t[:50] + '...' if len(t) > 50 else t for t in texts[:2]]}"
+        )
 
         # Ensure we don't exceed the maximum batch size
         if len(texts) > MAX_BATCH:
@@ -199,10 +229,10 @@ class KindRecommenderDVM(EZDVM):
         # Create a request to the text2vector DVM (kind 5003)
         json_content = json.dumps(texts, separators=(",", ":"))
         self.logger.debug(f"JSON content size: {len(json_content)} bytes")
-        
-        builder = EventBuilder(
-            Kind(5003), json_content
-        ).tags([Tag.parse(["n", str(len(texts))])])
+
+        builder = EventBuilder(Kind(5003), json_content).tags(
+            [Tag.parse(["n", str(len(texts))])]
+        )
 
         # Send the request
         self.logger.info("Sending request to text2vector DVM...")
@@ -211,98 +241,112 @@ class KindRecommenderDVM(EZDVM):
             request_id = output.id.to_hex()
             self.logger.info(f"Sent embedding request with ID: {request_id}")
         except Exception as e:
-            self.logger.error(f"Error sending embedding request: {str(e)}", exc_info=True)
+            self.logger.error(
+                f"Error sending embedding request: {str(e)}", exc_info=True
+            )
             raise Exception(f"Failed to send embedding request: {str(e)}")
 
         # Wait for the response using subscription with a 1-hour time window
         self.logger.info("Setting up subscription with 1-hour time window...")
         one_hour_ago = Timestamp.from_secs(Timestamp.now().as_secs() - 3600)
         response_filter = Filter().event(output.id).since(one_hour_ago)
-        
+
         try:
             await self.client.subscribe(response_filter)
-            
+
             # Set up notification handler
             received_events = []
-            handler = self.NotificationHandler(request_id, self.logger, received_events)
-            notification_task = asyncio.create_task(self.client.handle_notifications(handler))
-            
+            handler = NotificationHandler(request_id, self.logger, received_events)
+            notification_task = asyncio.create_task(
+                self.client.handle_notifications(handler)
+            )
+
             # Wait for response with timeout
-            max_wait_time = 60  # seconds - increased from 15 to give more time for response
+            max_wait_time = (
+                120  # seconds - increased from 15 to give more time for response
+            )
             self.logger.info(f"Waiting up to {max_wait_time} seconds for responses...")
-            
+
             # Wait and check periodically if we've received any events
             start_time = time.time()
             response_event = None
-            
-            while time.time() - start_time < max_wait_time:
-                await asyncio.sleep(1)  # Check every second
-                
-                # Look for kind 6003 events in received events
-                for ev in received_events:
-                    event_kind = ev.kind().as_u16()
-                    self.logger.info(f"Checking event with kind: {event_kind}")
-                    if event_kind == 6003:
-                        response_event = ev
-                        self.logger.info(f"Found response event with kind 6003")
-                        break
-                
-                if response_event:
-                    break
-            
+            job_result_event = None
+            try:
+                await asyncio.wait_for(
+                    handler.job_completed.wait(), timeout=max_wait_time
+                )
+                job_result_event = handler.job_result_event
+                self.logger.info(f"Embedding job completed!")
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout after {max_wait_time}s")
+
             # Cancel notification handler
             notification_task.cancel()
             try:
                 await notification_task
             except asyncio.CancelledError:
                 pass
-            
+
             # Process the response if we got one
-            if response_event:
-                response_id = response_event.id().to_hex()
+            if job_result_event:
+                response_id = job_result_event.id().to_hex()
                 self.logger.info(f"Received embedding response with ID: {response_id}")
-                
+
                 # Check if the response has the expected tags
-                tags = response_event.tags().to_vec()
+                tags = job_result_event.tags().to_vec()
                 tag_dict = {}
                 for tag in tags:
                     tag_parts = tag.as_vec()
                     if len(tag_parts) >= 2:
                         tag_dict[tag_parts[0]] = tag_parts[1]
-                
+
                 self.logger.debug(f"Response tags: {tag_dict}")
-                
+
                 # Check status tag
                 if "status" in tag_dict and tag_dict["status"] != "success":
-                    self.logger.warning(f"Response status is not success: {tag_dict['status']}")
-                    raise Exception(f"Text2vector DVM returned status: {tag_dict['status']}")
-                
+                    self.logger.warning(
+                        f"Response status is not success: {tag_dict['status']}"
+                    )
+                    raise Exception(
+                        f"Text2vector DVM returned status: {tag_dict['status']}"
+                    )
+
                 # Parse the embeddings from the response
                 try:
-                    content = response_event.content()
+                    content = job_result_event.content()
                     content_size = len(content)
                     self.logger.info(f"Response content size: {content_size} bytes")
-                    
+
                     if content_size == 0:
                         self.logger.error("Empty response content")
                         raise Exception("Empty response content from text2vector DVM")
-                        
+
                     embeddings = json.loads(content)
                     if not isinstance(embeddings, list):
-                        self.logger.error(f"Unexpected embeddings format: {type(embeddings)}")
-                        raise Exception(f"Unexpected embeddings format: {type(embeddings)}")
-                        
-                    self.logger.info(f"Successfully parsed embeddings: shape {len(embeddings)}x{len(embeddings[0]) if embeddings and isinstance(embeddings[0], list) else '?'}")
+                        self.logger.error(
+                            f"Unexpected embeddings format: {type(embeddings)}"
+                        )
+                        raise Exception(
+                            f"Unexpected embeddings format: {type(embeddings)}"
+                        )
+
+                    self.logger.info(
+                        f"Successfully parsed embeddings: shape {len(embeddings)}x{len(embeddings[0]) if embeddings and isinstance(embeddings[0], list) else '?'}"
+                    )
                     return np.array(embeddings)
                 except json.JSONDecodeError as e:
                     self.logger.error(f"JSON decode error: {str(e)}")
                     raise Exception(f"Failed to parse response: {str(e)}")
             else:
                 self.logger.error("No response received within the timeout period")
-                raise Exception("No response received from text2vector DVM within the timeout period")
-                
+                raise Exception(
+                    "No response received from text2vector DVM within the timeout period"
+                )
+
         except Exception as e:
-            self.logger.error(f"Error getting embedding response: {str(e)}", exc_info=True)
+            self.logger.error(
+                f"Error getting embedding response: {str(e)}", exc_info=True
+            )
             raise Exception(f"Failed to get embedding response: {str(e)}")
 
     async def generate_llm_response(
@@ -353,53 +397,57 @@ class KindRecommenderDVM(EZDVM):
         self.logger.info("Setting up subscription with 1-hour time window...")
         one_hour_ago = Timestamp.from_secs(Timestamp.now().as_secs() - 3600)
         response_filter = Filter().event(output.id).since(one_hour_ago)
-        
+
         try:
             await self.client.subscribe(response_filter)
-            
+
             # Set up notification handler
             received_events = []
             handler = self.NotificationHandler(request_id, self.logger, received_events)
-            notification_task = asyncio.create_task(self.client.handle_notifications(handler))
-            
+            notification_task = asyncio.create_task(
+                self.client.handle_notifications(handler)
+            )
+
             # Wait for response with timeout
             max_wait_time = 30  # seconds (longer for LLM responses)
             self.logger.info(f"Waiting up to {max_wait_time} seconds for responses...")
-            
+
             # Wait and check periodically if we've received any events
             start_time = time.time()
             response_event = None
-            
+
             while time.time() - start_time < max_wait_time:
                 await asyncio.sleep(1)  # Check every second
-                
+
                 # Look for kind 6050 events in received events
                 for ev in received_events:
                     if ev.kind().as_u16() == 6050:
                         response_event = ev
                         break
-                
+
                 if response_event:
                     break
-            
+
             # Cancel notification handler
             notification_task.cancel()
             try:
                 await notification_task
             except asyncio.CancelledError:
                 pass
-            
+
             # Process the response if we got one
             if response_event:
                 response_id = response_event.id().to_hex()
                 self.logger.info(f"Received LLM response with ID: {response_id}")
-                
+
                 # The content of the response is the generated text
                 return response_event.content()
             else:
                 self.logger.error("No LLM response received within the timeout period")
-                raise Exception("No response received from LLM DVM within the timeout period")
-                
+                raise Exception(
+                    "No response received from LLM DVM within the timeout period"
+                )
+
         except Exception as e:
             self.logger.error(f"Error getting LLM response: {str(e)}", exc_info=True)
             raise Exception(f"Failed to get LLM response: {str(e)}")
@@ -681,7 +729,10 @@ Your explanation should be informative but friendly, and should help the develop
 
             # Get embeddings for all descriptions
             descriptions = list(self.kind_descriptions.values())
-            self.embeddings = await self.get_embeddings(descriptions)
+            while len(descriptions) > MAX_BATCH:
+                batch_descriptions = descriptions[:MAX_BATCH]
+                descriptions = descriptions[MAX_BATCH:]
+                self.embeddings = await self.get_embeddings(batch_descriptions)
 
             # Find unused kinds (for now, we'll assume all kinds in our dictionary are used)
             used_kinds = set(self.kind_descriptions.keys())
